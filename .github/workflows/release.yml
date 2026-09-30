@@ -19,4 +19,5 @@ jobs:
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
+          name: netmapperv.1.1
           files: dist/*.deb
