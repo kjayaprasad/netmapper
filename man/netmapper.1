@@ -1,0 +1,70 @@
+.TH NETMAPPER 1 "2026-09-30" "netmapper 0.1.0" "User Commands"
+.SH NAME
+netmapper \- concurrent TCP port scanner for authorized network inventory
+.SH SYNOPSIS
+.B netmapper
+.B \-t
+.I target
+[B\-tR ItargetR ...]
+[B\-pR IportsR | B\-\-top-portsR InR]
+[B\-cR InR]
+[B\-\-timeout-msR ImillisecondsR]
+[B\-\-formatR Itable|jsonR]
+[B\-oR IfileR]
+.SH DESCRIPTION
+.B netmapper
+resolves IPv4 and IPv6 addresses, CIDR networks, and DNS names, then attempts TCP connections to selected ports. Each probe is reported as open, closed, or filtered. The scanner uses bounded concurrency and enforces limits of 4,096 resolved addresses and 1,000,000 probes per run.
+.PP
+Only scan systems and networks that you own or are explicitly authorized to assess.
+.SH OPTIONS
+.TP
+.BR \-t , \ \-\-target \ target
+Target IP address, CIDR network, or DNS name. Repeat this option for multiple targets.
+.TP
+.BR \-p , \ \-\-ports \ ports
+Comma-separated TCP ports and inclusive ranges, for example 22,80,443,8000-8100. Port zero is invalid. Defaults to the built-in 100-port common set.
+.TP
+.BR \-\-top-ports \ n
+Use the first 1 to 100 entries from the built-in common-port set. The set is not claimed to match Nmap's port ranking.
+.TP
+.BR \-c , \ \-\-concurrency \ n
+Maximum simultaneous connection attempts, from 1 to 8192. Default: 512.
+.TP
+.BR \-\-timeout-ms \ milliseconds
+Per-port connect timeout, from 50 to 60000 milliseconds. Default: 1000.
+.TP
+.BR \ \-\-format \ format
+Output as BtableR (default) or BjsonR.
+.TP
+.BR \-o , \ \-\-output \ file
+Write formatted results to a file instead of standard output.
+.TP
+.BR \-h , \ \-\-help
+Print command help.
+.TP
+.BR \-V , \ \-\-version
+Print version.
+.SH STATES
+.TP
+.B open
+The TCP connection completed successfully. This does not identify the application protocol.
+.TP
+.B closed
+The remote endpoint explicitly refused the TCP connection.
+.TP
+.B filtered
+The attempt timed out or failed without an explicit connection refusal. This is an inference and does not prove a firewall caused the result.
+.SH LIMITATIONS
+This version performs TCP connect scans only. It does not implement raw SYN scans, UDP scans, service/version detection, OS fingerprinting, traceroute, Nmap scripts, or Nmap XML output. The service column is a static port-number hint, not protocol detection. Scanning can trigger monitoring alerts and network policy controls.
+.SH EXAMPLES
+.TP
+Scan a host using the built-in common ports:
+.B netmapper -t 192.0.2.15
+.TP
+Scan selected ports on an authorized target:
+.B netmapper -t app.example.test -p 22,80,443,8000-8100
+.TP
+Write JSON results to a file:
+.B netmapper -t 192.0.2.15 -p 22,443 --format json -o scan.json
+.SH SEE ALSO
+.BR nmap (1)
