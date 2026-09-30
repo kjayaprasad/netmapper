@@ -6,7 +6,8 @@ VERSION=$(awk -F '"' '$1 ~ /^version = / { print $2; exit }' "$ROOT/Cargo.toml")
 ARCH=$(dpkg --print-architecture)
 STAGING=$(mktemp -d)
 OUTPUT_DIR="$ROOT/dist"
-OUTPUT="$OUTPUT_DIR/netmapper_${VERSION}_${ARCH}.deb"
+OUTPUT="$OUTPUT_DIR/netmapper.dpkg"
+PARENT_OUTPUT="$ROOT/../netmapper.dpkg"
 BINARY="$ROOT/target/release/netmapper"
 
 if [ -z "$VERSION" ]; then
@@ -30,12 +31,17 @@ if [ -z "$GLIBC_VERSION" ]; then
     echo "Could not determine the binary's minimum GLIBC version" >&2
     exit 1
 fi
-mkdir -p "$STAGING/DEBIAN" "$STAGING/usr/bin" "$STAGING/usr/share/man/man1" "$OUTPUT_DIR"
+mkdir -p "$STAGING/DEBIAN" "$STAGING/usr/bin" "$STAGING/usr/share/man/man1" \
+    "$STAGING/usr/share/icons/hicolor/scalable/apps" "$OUTPUT_DIR"
 install -m 0755 "$BINARY" "$STAGING/usr/bin/netmapper"
 install -m 0644 "$ROOT/man/netmapper.1" "$STAGING/usr/share/man/man1/netmapper.1"
+install -m 0644 "$ROOT/assets/netmapper.svg" \
+    "$STAGING/usr/share/icons/hicolor/scalable/apps/netmapper.svg"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@ARCH@/$ARCH/g" \
     "$ROOT/debian/control.in" > "$STAGING/DEBIAN/control"
 sed -i "s/@GLIBC_VERSION@/$GLIBC_VERSION/g" "$STAGING/DEBIAN/control"
 printf '\n' >> "$STAGING/DEBIAN/control"
 dpkg-deb --root-owner-group --build "$STAGING" "$OUTPUT"
+install -m 0644 "$OUTPUT" "$PARENT_OUTPUT"
 printf 'Created %s\n' "$OUTPUT"
+printf 'Copied standalone package to %s\n' "$PARENT_OUTPUT"

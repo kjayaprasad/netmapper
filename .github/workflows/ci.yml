@@ -22,5 +22,5 @@ jobs:
         run: ./scripts/build-deb.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: netmapper-deb
-          path: dist/*.deb
+          name: netmapper-dpkg
+          path: dist/netmapper.dpkg

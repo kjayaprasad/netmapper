@@ -1,46 +1,51 @@
-.TH NETMAPPER 1 "2026-09-30" "netmapper 1.1.0" "User Commands"
+.TH NETMAPPER 1 "2026-09-30" "netmapper 1.2.0" "User Commands"
 .SH NAME
-netmapper \- concurrent TCP and UDP scanner for authorized network inventory
+netmapper \- independent bounded TCP and UDP network scanner
 .SH SYNOPSIS
 .B netmapper
 .B \-t
 .I target
-[B\-tR ItargetR ...]
-[B\-pR IportsR | B\-\-top-portsR InR]
-[B\-cR InR]
-[B\-\-timeout-msR ImillisecondsR]
-[B\-\-formatR Itable|jsonR]
-[B\-oR IfileR]
+[\fB\-t\fR \fItarget\fR ...]
+[\fB\-p\fR \fIports\fR | \fB\-\-top-ports\fR \fIn\fR | \fB\-\-all-ports\fR]
+[\fB\-\-scan-mode\fR \fItcp|udp|both\fR]
+[\fB\-s\fR]
+[\fB\-\-format\fR \fItable|json\fR]
+[\fB\-o\fR \fIfile\fR]
 .SH DESCRIPTION
 .B netmapper
-resolves IPv4 and IPv6 addresses, CIDR networks, and DNS names, then probes selected TCP and/or UDP ports. TCP uses connect probes. UDP sends DNS and NTP requests on their conventional ports and an empty datagram elsewhere. UDP silence is reported as open|filtered because it cannot distinguish a silent service from packet loss. The scanner uses bounded concurrency and enforces limits of 4,096 resolved addresses and 1,000,000 probes per run.
+is an independent network scanner. It resolves IPv4/IPv6 addresses, CIDR networks, and DNS names, then uses bounded TCP connect probes and UDP request/response probes. It can collect limited HTTP or passive TCP banner evidence and emit a terminal table or JSON report.
+.PP
+Netmapper does not invoke or require Nmap. It does not currently implement raw-packet scan types, OS fingerprinting, comprehensive service/version fingerprints, traceroute, or an extensible script engine. It does not claim full Nmap feature parity.
 .PP
 Only scan systems and networks that you own or are explicitly authorized to assess.
 .SH OPTIONS
 .TP
 .BR \-t , \ \-\-target \ target
-Target IP address, CIDR network, or DNS name. Repeat this option for multiple targets.
+Target IP address, CIDR network, or DNS name. Repeat for multiple targets.
 .TP
 .BR \-p , \ \-\-ports \ ports
-Comma-separated ports and inclusive ranges, for example 22,53,80,443,8000-8100. Port zero is invalid. Defaults to the built-in 100-port common set.
+Comma-separated ports and inclusive ranges, for example 22,53,80,443,8000-8100. Port zero is invalid.
 .TP
 .BR \-\-top-ports \ n
-Use the first 1 to 100 entries from the built-in common-port set. The set is not claimed to match Nmap's port ranking.
+Select the first 1 to 100 entries from the built-in common-port set. Default: 100.
+.TP
+.BR \-\-all-ports
+Scan ports 1-65535 for selected protocol(s). Scans are limited to one million probes per run.
+.TP
+.BR \-\-scan-mode \ mode
+Select tcp (default), udp, or both.
 .TP
 .BR \-c , \ \-\-concurrency \ n
 Maximum simultaneous probes per protocol, from 1 to 8192. Default: 512.
 .TP
-.BR \ \-\-scan-mode \ mode
-Select tcp (default), udp, or both.
-.TP
-.BR \-s , \ \-\-service-detection
-Collect banners from open TCP ports. HTTP ports receive a HEAD request; other ports are read for a passive banner. This is not exhaustive Nmap service fingerprinting.
-.TP
 .BR \-\-timeout-ms \ milliseconds
 Per-probe timeout, from 50 to 60000 milliseconds. Default: 1000.
 .TP
+.BR \-s , \ \-\-service-detection
+Collect an HTTP response header or a passive TCP banner from open TCP ports. This is not comprehensive service fingerprinting.
+.TP
 .BR \ \-\-format \ format
-Output as BtableR (default) or BjsonR.
+Output as table (default) or JSON. Interactive table output highlights port numbers in orange.
 .TP
 .BR \-o , \ \-\-output \ file
 Write formatted results to a file instead of standard output.
@@ -59,21 +64,24 @@ The TCP connection completed or a UDP response was received.
 The remote endpoint explicitly refused the TCP connection.
 .TP
 .B filtered
-The attempt timed out or failed without an explicit connection refusal. This is an inference and does not prove a firewall caused the result.
+The attempt timed out or failed without an explicit connection refusal.
 .TP
 .B open|filtered
 A UDP probe received no response before timeout. The port may be open or filtered.
-.SH LIMITATIONS
-This version does not implement raw SYN/ACK scans, OS fingerprinting, TLS service fingerprints, traceroute, Nmap scripts, or Nmap XML output. The service column is a static port-number hint. Banner collection is limited to HTTP response headers and passive TCP banners; it is not full Nmap service/version detection. Scanning can trigger monitoring alerts and network policy controls.
 .SH EXAMPLES
 .TP
-Scan a host using the built-in common ports:
+Scan default common TCP ports on an authorized target:
 .B netmapper -t 192.0.2.15
 .TP
-Scan selected ports on an authorized target:
-.B netmapper -t app.example.test -p 22,80,443,8000-8100
+Scan both transports on selected ports:
+.B netmapper -t 192.0.2.15 --scan-mode both -p 22,53,80,443
 .TP
-Write JSON results to a file:
-.B netmapper -t 192.0.2.15 -p 22,443 --format json -o scan.json
+Scan all TCP ports:
+.B netmapper -t 192.0.2.15 --all-ports
+.TP
+Collect TCP banner evidence and write a JSON report:
+.B netmapper -t 192.0.2.15 -p 22,80,443 -s --format json -o scan.json
+.SH LIMITATIONS
+The built-in scanner is a bounded inventory scanner. It does not currently match all Nmap features. TCP connect probes can complete connections on open ports. UDP silence is ambiguous; the built-in DNS and NTP probes are limited, and other UDP ports receive an empty datagram. Results depend on routing, firewalls, packet loss, and remote rate limiting. Scanning may trigger monitoring or network policy controls.
 .SH SEE ALSO
-.BR nmap (1)
+.BR ip (8)

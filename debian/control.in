@@ -1,10 +1,10 @@
-Package: netmapper
+Package: netmapperv1
 Version: @VERSION@
 Section: net
 Priority: optional
 Architecture: @ARCH@
 Maintainer: Netmapper Contributors <netmapper@example.org>
 Depends: libc6 (>= @GLIBC_VERSION@)
-Description: concurrent TCP and UDP scanner for authorized network inventory
- Netmapper resolves IP addresses, CIDR networks, and DNS names, then reports
- TCP and UDP port states using bounded probes and optional TCP banner detection.
+Description: independent bounded TCP and UDP network scanner
+ Netmapper resolves IPv4 and IPv6 targets and provides a bounded built-in
+ scanner with optional TCP banner collection, JSON output, and full-port scans.
