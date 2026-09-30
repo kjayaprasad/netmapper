@@ -9,7 +9,8 @@ use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use serde::Serialize;
 use tokio::{
-    net::{lookup_host, TcpStream},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{lookup_host, TcpStream, UdpSocket},
     task::JoinSet,
     time::timeout,
 };
@@ -27,19 +28,29 @@ const COMMON_PORTS: [u16; 100] = [
     10_001, 10_010, 20_000, 32_768, 40_000, 49_152, 49_153, 49_154, 49_155, 49_156, 49_157, 49_158,
 ];
 
+const DNS_QUERY: [u8; 29] = [
+    0x4e, 0x4d, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e', b'x', b'a',
+    b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+];
+const NTP_QUERY: [u8; 48] = [0x1b; 48];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PortState {
     Open,
     Closed,
     Filtered,
+    #[serde(rename = "open|filtered")]
+    OpenFiltered,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ScanResult {
     pub target: IpAddr,
+    pub protocol: &'static str,
     pub port: u16,
     pub service: &'static str,
+    pub version: Option<String>,
     pub state: PortState,
     pub latency_ms: u128,
     pub reason: Option<String>,
@@ -52,6 +63,7 @@ pub struct ScanSummary {
     pub open: usize,
     pub closed: usize,
     pub filtered: usize,
+    pub open_filtered: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,6 +153,16 @@ pub async fn scan_tcp(
     concurrency: usize,
     timeout_duration: Duration,
 ) -> Result<Vec<ScanResult>> {
+    scan_tcp_with_detection(targets, ports, concurrency, timeout_duration, false).await
+}
+
+pub async fn scan_tcp_with_detection(
+    targets: &[IpAddr],
+    ports: &[u16],
+    concurrency: usize,
+    timeout_duration: Duration,
+    detect_version: bool,
+) -> Result<Vec<ScanResult>> {
     if targets.is_empty() {
         bail!("at least one target address is required");
     }
@@ -169,7 +191,7 @@ pub async fn scan_tcp(
             let target = targets[next / ports.len()];
             let port = ports[next % ports.len()];
             next += 1;
-            jobs.spawn(probe(target, port, timeout_duration));
+            jobs.spawn(probe(target, port, timeout_duration, detect_version));
         }
         if let Some(result) = jobs.join_next().await {
             results.push(result.context("TCP probe task failed")?);
@@ -179,15 +201,168 @@ pub async fn scan_tcp(
     Ok(results)
 }
 
-async fn probe(target: IpAddr, port: u16, timeout_duration: Duration) -> ScanResult {
+async fn probe(
+    target: IpAddr,
+    port: u16,
+    timeout_duration: Duration,
+    detect_version: bool,
+) -> ScanResult {
     let started = Instant::now();
     let address = SocketAddr::new(target, port);
     let result = timeout(timeout_duration, TcpStream::connect(address)).await;
     let (state, reason) = classify_connect_result(result, timeout_duration);
+    let version = if detect_version && state == PortState::Open {
+        identify_tcp_service(address, port, timeout_duration).await
+    } else {
+        None
+    };
     ScanResult {
         target,
+        protocol: "tcp",
         port,
         service: service_name(port),
+        version,
+        state,
+        latency_ms: started.elapsed().as_millis(),
+        reason,
+    }
+}
+
+async fn identify_tcp_service(
+    address: SocketAddr,
+    port: u16,
+    timeout_duration: Duration,
+) -> Option<String> {
+    let mut stream = timeout(timeout_duration, TcpStream::connect(address))
+        .await
+        .ok()?
+        .ok()?;
+    if matches!(port, 80 | 8000 | 8008 | 8080 | 8081 | 8888) {
+        timeout(
+            timeout_duration,
+            stream.write_all(b"HEAD / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        )
+        .await
+        .ok()?
+        .ok()?;
+    }
+    let mut response = [0; 1024];
+    let read_timeout = timeout_duration.min(Duration::from_millis(400));
+    let length = timeout(read_timeout, stream.read(&mut response))
+        .await
+        .ok()?
+        .ok()?;
+    if length == 0 {
+        return None;
+    }
+    let response = String::from_utf8_lossy(&response[..length]);
+    let first_line = response.lines().next()?.trim();
+    let details = if first_line.starts_with("HTTP/") {
+        response
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("server:"))
+            .map(|server| format!("{first_line}; {}", server.trim()))
+            .unwrap_or_else(|| first_line.to_string())
+    } else {
+        first_line.to_string()
+    };
+    let details: String = details
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect();
+    (!details.is_empty()).then_some(details)
+}
+
+pub async fn scan_udp(
+    targets: &[IpAddr],
+    ports: &[u16],
+    concurrency: usize,
+    timeout_duration: Duration,
+) -> Result<Vec<ScanResult>> {
+    if targets.is_empty() {
+        bail!("at least one target address is required");
+    }
+    if ports.is_empty() {
+        bail!("at least one UDP port is required");
+    }
+    if ports.contains(&0) {
+        bail!("port 0 is not a valid UDP destination port");
+    }
+    let total = targets
+        .len()
+        .checked_mul(ports.len())
+        .context("probe count overflow")?;
+    if total > MAX_PROBES {
+        bail!("scan would run {total} probes; reduce targets or ports (limit: {MAX_PROBES})");
+    }
+    if concurrency == 0 {
+        bail!("concurrency must be greater than zero");
+    }
+
+    let mut jobs = JoinSet::new();
+    let mut next = 0;
+    let mut results = Vec::with_capacity(total);
+    while next < total || !jobs.is_empty() {
+        while next < total && jobs.len() < concurrency {
+            let target = targets[next / ports.len()];
+            let port = ports[next % ports.len()];
+            next += 1;
+            jobs.spawn(probe_udp(target, port, timeout_duration));
+        }
+        if let Some(result) = jobs.join_next().await {
+            results.push(result.context("UDP probe task failed")?);
+        }
+    }
+    results.sort_by_key(|result| (result.target, result.port));
+    Ok(results)
+}
+
+fn udp_probe_payload(port: u16) -> &'static [u8] {
+    match port {
+        53 => &DNS_QUERY,
+        123 => &NTP_QUERY,
+        _ => &[],
+    }
+}
+
+async fn probe_udp(target: IpAddr, port: u16, timeout_duration: Duration) -> ScanResult {
+    let started = Instant::now();
+    let bind_address = match target {
+        IpAddr::V4(_) => "0.0.0.0:0",
+        IpAddr::V6(_) => "[::]:0",
+    };
+    let outcome = match UdpSocket::bind(bind_address).await {
+        Ok(socket) => match socket.connect(SocketAddr::new(target, port)).await {
+            Ok(()) => {
+                timeout(timeout_duration, async {
+                    socket.send(udp_probe_payload(port)).await?;
+                    let mut response = [0; 512];
+                    socket.recv(&mut response).await
+                })
+                .await
+            }
+            Err(error) => Ok(Err(error)),
+        },
+        Err(error) => Ok(Err(error)),
+    };
+    let (state, reason) = match outcome {
+        Ok(Ok(_)) => (PortState::Open, None),
+        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
+            (PortState::Closed, Some(error.to_string()))
+        }
+        Ok(Err(error)) => (PortState::Filtered, Some(error.to_string())),
+        Err(_) => (
+            PortState::OpenFiltered,
+            Some("no UDP response received before timeout".to_string()),
+        ),
+    };
+    ScanResult {
+        target,
+        protocol: "udp",
+        port,
+        service: service_name(port),
+        version: None,
         state,
         latency_ms: started.elapsed().as_millis(),
         reason,
@@ -264,6 +439,10 @@ pub fn make_report(results: Vec<ScanResult>, target_count: usize) -> ScanReport 
         .iter()
         .filter(|result| result.state == PortState::Filtered)
         .count();
+    let open_filtered = results
+        .iter()
+        .filter(|result| result.state == PortState::OpenFiltered)
+        .count();
     ScanReport {
         scanner: "netmapper",
         version: env!("CARGO_PKG_VERSION"),
@@ -273,6 +452,7 @@ pub fn make_report(results: Vec<ScanResult>, target_count: usize) -> ScanReport 
             open,
             closed,
             filtered,
+            open_filtered,
         },
         results,
     }
@@ -350,5 +530,57 @@ mod tests {
         assert!(scan_tcp(&[], &[80], 1, Duration::from_millis(100))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn detects_a_loopback_udp_responder() {
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = responder.local_addr().unwrap().port();
+        let responder_task = tokio::spawn(async move {
+            let mut request = [0; 1];
+            let (_, peer) = responder.recv_from(&mut request).await.unwrap();
+            responder.send_to(b"ok", peer).await.unwrap();
+        });
+
+        let results = scan_udp(
+            &[IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+            &[port],
+            1,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        responder_task.await.unwrap();
+        assert_eq!(results[0].protocol, "udp");
+        assert_eq!(results[0].state, PortState::Open);
+    }
+
+    #[test]
+    fn selects_protocol_aware_udp_probes_for_dns_and_ntp() {
+        assert_eq!(udp_probe_payload(53).len(), 29);
+        assert_eq!(udp_probe_payload(123).len(), 48);
+        assert!(udp_probe_payload(9999).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reads_http_server_version_banner() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 256];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.0 200 OK\r\nServer: netmapper-test/1.0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let version = identify_tcp_service(address, 80, Duration::from_secs(1)).await;
+        server.await.unwrap();
+        assert_eq!(
+            version.as_deref(),
+            Some("HTTP/1.0 200 OK; Server: netmapper-test/1.0")
+        );
     }
 }

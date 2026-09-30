@@ -5,6 +5,6 @@ Priority: optional
 Architecture: @ARCH@
 Maintainer: Netmapper Contributors <netmapper@example.org>
 Depends: libc6 (>= @GLIBC_VERSION@)
-Description: concurrent TCP port scanner for authorized network inventory
+Description: concurrent TCP and UDP scanner for authorized network inventory
  Netmapper resolves IP addresses, CIDR networks, and DNS names, then reports
- TCP ports as open, closed, or filtered using bounded connect probes.
+ TCP and UDP port states using bounded probes and optional TCP banner detection.
