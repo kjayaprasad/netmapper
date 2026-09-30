@@ -2,7 +2,7 @@
 
 ![Netmapper radar-and-route logo](assets/netmapper.svg)
 
-`netmapper` is an independent Kali-oriented network scanner for authorized assessments. It does not invoke Nmap or require Nmap to be installed. It accepts IP addresses, CIDR networks, and DNS names; scans selected TCP and/or UDP ports; and reports state, latency, port-name hints, and optional TCP banner evidence.
+`netmapper` is an independent Kali-oriented network scanner for authorized assessments. It does not invoke Nmap or require Nmap to be installed. It accepts IP addresses, CIDR networks, and DNS names; scans selected TCP and/or UDP ports; and reports state, latency, port-name hints, and optional TCP service evidence.
 
 Netmapper is not yet at Nmap feature parity. It currently implements TCP connect probes, UDP request/response probes, bounded concurrency, IPv4/IPv6 target resolution, selected or full port ranges, HTTP/passive TCP banner collection, and table/JSON reports. It does not currently implement raw packet scan types, OS fingerprinting, comprehensive service/version probes, traceroute, or a script engine. Those are substantial independent features; do not interpret the presence of a CLI option as a substitute for them.
 
@@ -16,6 +16,8 @@ Only scan systems and networks that you own or are explicitly authorized to asse
 - Start with a built-in set of 100 commonly used ports, select a prefix with `--top-ports`, or scan all ports with `--all-ports`.
 - Send a DNS query to UDP/53 and an NTP request to UDP/123; other UDP ports receive an empty datagram.
 - Optionally collect TCP banners and HTTP response headers with `--service-detection`.
+- Optionally inspect plaintext HTTP response headers for possible WAF/CDN/proxy signatures with `--firewall-detection`.
+- Report filtering uncertainty without claiming a firewall product or version from timeouts.
 - Bound concurrent probes and configure the per-probe timeout.
 - Display port states and banner evidence in a readable table or JSON.
 - Write output to a selected file.
@@ -75,6 +77,12 @@ Scan both protocols and collect lightweight TCP banners:
 netmapper -t 192.0.2.15 --scan-mode both -p 22,53,80,123,443 -s
 ```
 
+Inspect supported HTTP response headers for possible edge/WAF indicators:
+
+```sh
+netmapper -t 192.0.2.15 -p 80,8080 --firewall-detection
+```
+
 Write machine-readable JSON:
 
 ```sh
@@ -89,7 +97,7 @@ The example addresses use the documentation-only `192.0.2.0/24` range. Replace t
 - **closed**: the remote stack actively refused the TCP connection.
 - **filtered**: the attempt timed out or failed for another reason that did not establish an open connection or an explicit refusal. This is an inference, not proof that a firewall caused the result.
 
-The `service` field is a static port-number hint. When enabled, `version` contains a captured HTTP status/server header or the first line of a passive TCP banner; this is evidence, not a comprehensive service fingerprint. Latency is measured in milliseconds.
+The `service` field is a static port-number hint. When enabled, `version` contains the HTTP status plus available `Server`/`X-Powered-By` headers, or the first line of a passive TCP banner; this is evidence, not a comprehensive service fingerprint. `--firewall-detection` adds possible signatures for Cloudflare, Akamai, Imperva, Sucuri, F5, and Amazon CloudFront, plus generic proxy/cache headers. These may indicate a CDN or reverse proxy rather than a WAF; headers can be hidden, changed, or spoofed, and do not verify product versions. Checks use a non-invasive `HEAD /` request on supported plaintext HTTP ports only; HTTPS/TLS fingerprinting is not implemented. Filtered/inconclusive results may be caused by firewall rules, host policy, routing, or packet loss; they cannot identify a firewall. Latency is measured in milliseconds.
 
 ## CLI reference
 
@@ -103,6 +111,7 @@ The `service` field is a static port-number hint. When enabled, `version` contai
 | `--timeout-ms <MS>` | `1000` | Per-probe timeout (50-60000 milliseconds). |
 | `--scan-mode <MODE>` | `tcp` | `tcp`, `udp`, or `both`. |
 | `-s`, `--service-detection` | Disabled | Collect HTTP headers or passive banners from open TCP ports. |
+| `--firewall-detection` | Disabled | Inspect supported plaintext HTTP responses for heuristic WAF/CDN/proxy signatures and report inconclusive filtering observations; requires TCP. |
 | `--format <FORMAT>` | `table` | `table` or `json`. |
 | `-o`, `--output <FILE>` | Standard output | Write formatted output to a file. |
 | `-h`, `--help` | | Print help. |
@@ -120,10 +129,10 @@ Build a Debian package from the source tree:
 ./scripts/build-deb.sh
 ```
 
-The standalone Debian archive is written as `dist/netmapper.dpkg` and copied to `../netmapper.dpkg` (the parent `network-tools` directory in this workspace). The package identity is `netmapperv1` version `1.2.0`; it installs `/usr/bin/netmapper`, the man page, and the app icon. It does not depend on Nmap. Install and inspect it with:
+The versioned Debian package is written as `dist/netmapperv1_1.2.1_amd64.deb` (the architecture suffix varies) and copied to the parent `network-tools` directory. For compatibility, the build also writes `dist/netmapper.dpkg` and `../netmapper.dpkg`. The package identity is `netmapperv1` version `1.2.1`; it installs `/usr/bin/netmapper`, the man page, and the app icon. It does not depend on Nmap. Install the versioned package with:
 
 ```sh
-sudo dpkg -i ./dist/netmapper.dpkg
+sudo dpkg -i ./dist/netmapperv1_1.2.1_amd64.deb
 netmapper --help
 man netmapper
 ```
@@ -141,8 +150,8 @@ cargo clippy --all-targets --locked -- -D warnings
 ./scripts/build-deb.sh
 ```
 
-Every push builds a Debian archive workflow artifact. Pushing a version tag such as `v1.2.0` also creates a GitHub Release and attaches the package. The package version is read from `Cargo.toml`; update it and add a `CHANGELOG.md` entry for each release.
+Every push builds a Debian archive workflow artifact. Pushing a new version tag such as `v1.2.1` creates a GitHub Release named from that tag, attaches the versioned `.deb`, and uses the matching `CHANGELOG.md` section as the release description. Existing tags and releases are retained. The tag must match the version in `Cargo.toml`; update that version and add a changelog section describing the problem solved and changes for each release. `CHANGELOG.md` records the changes for each version released so far.
 
 ## Limitations and roadmap
 
-TCP connect probes can create a completed connection on open ports. UDP silence remains ambiguous. Netmapper is an independent project and does not claim full Nmap feature parity; adding raw packet scanning, robust service fingerprints, OS detection, and a standalone extensible script engine requires separate implementation and validation. Contributions should preserve bounded resource use, explicit scope, and transparent result interpretation.
+TCP connect probes can create a completed connection on open ports. UDP silence remains ambiguous. Firewall/WAF observations are heuristic and limited to plaintext HTTP headers and scan outcomes; no firewall product/version is established, and the scanner does not provide firewall-evasion guidance. Netmapper does not claim full Nmap feature parity; raw packet scan types, OS detection, comprehensive service fingerprints, traceroute, and a standalone extensible script engine remain unimplemented. Contributions should preserve bounded resource use, explicit scope, and transparent result interpretation.

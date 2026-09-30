@@ -51,6 +51,7 @@ pub struct ScanResult {
     pub port: u16,
     pub service: &'static str,
     pub version: Option<String>,
+    pub indicators: Vec<String>,
     pub state: PortState,
     pub latency_ms: u128,
     pub reason: Option<String>,
@@ -64,6 +65,7 @@ pub struct ScanSummary {
     pub closed: usize,
     pub filtered: usize,
     pub open_filtered: usize,
+    pub filtering_assessment: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +165,25 @@ pub async fn scan_tcp_with_detection(
     timeout_duration: Duration,
     detect_version: bool,
 ) -> Result<Vec<ScanResult>> {
+    scan_tcp_with_options(
+        targets,
+        ports,
+        concurrency,
+        timeout_duration,
+        detect_version,
+        false,
+    )
+    .await
+}
+
+pub async fn scan_tcp_with_options(
+    targets: &[IpAddr],
+    ports: &[u16],
+    concurrency: usize,
+    timeout_duration: Duration,
+    detect_version: bool,
+    detect_firewall: bool,
+) -> Result<Vec<ScanResult>> {
     if targets.is_empty() {
         bail!("at least one target address is required");
     }
@@ -191,7 +212,13 @@ pub async fn scan_tcp_with_detection(
             let target = targets[next / ports.len()];
             let port = ports[next % ports.len()];
             next += 1;
-            jobs.spawn(probe(target, port, timeout_duration, detect_version));
+            jobs.spawn(probe(
+                target,
+                port,
+                timeout_duration,
+                detect_version,
+                detect_firewall,
+            ));
         }
         if let Some(result) = jobs.join_next().await {
             results.push(result.context("TCP probe task failed")?);
@@ -206,22 +233,33 @@ async fn probe(
     port: u16,
     timeout_duration: Duration,
     detect_version: bool,
+    detect_firewall: bool,
 ) -> ScanResult {
     let started = Instant::now();
     let address = SocketAddr::new(target, port);
     let result = timeout(timeout_duration, TcpStream::connect(address)).await;
     let (state, reason) = classify_connect_result(result, timeout_duration);
-    let version = if detect_version && state == PortState::Open {
-        identify_tcp_service(address, port, timeout_duration).await
+    let evidence = if (detect_version || detect_firewall) && state == PortState::Open {
+        identify_tcp_service(address, port, timeout_duration, detect_firewall).await
     } else {
         None
     };
+    let mut indicators = evidence
+        .as_ref()
+        .map_or_else(Vec::new, |evidence| evidence.indicators.clone());
+    if detect_firewall && state == PortState::Filtered {
+        indicators.push(
+            "Possible network filtering; timeout/error is inconclusive and does not identify a device."
+                .to_string(),
+        );
+    }
     ScanResult {
         target,
         protocol: "tcp",
         port,
         service: service_name(port),
-        version,
+        version: evidence.and_then(|evidence| evidence.version),
+        indicators,
         state,
         latency_ms: started.elapsed().as_millis(),
         reason,
@@ -232,7 +270,8 @@ async fn identify_tcp_service(
     address: SocketAddr,
     port: u16,
     timeout_duration: Duration,
-) -> Option<String> {
+    detect_firewall: bool,
+) -> Option<ServiceEvidence> {
     let mut stream = timeout(timeout_duration, TcpStream::connect(address))
         .await
         .ok()?
@@ -246,7 +285,7 @@ async fn identify_tcp_service(
         .ok()?
         .ok()?;
     }
-    let mut response = [0; 1024];
+    let mut response = [0; 4096];
     let read_timeout = timeout_duration.min(Duration::from_millis(400));
     let length = timeout(read_timeout, stream.read(&mut response))
         .await
@@ -256,22 +295,87 @@ async fn identify_tcp_service(
         return None;
     }
     let response = String::from_utf8_lossy(&response[..length]);
-    let first_line = response.lines().next()?.trim();
-    let details = if first_line.starts_with("HTTP/") {
-        response
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("server:"))
-            .map(|server| format!("{first_line}; {}", server.trim()))
-            .unwrap_or_else(|| first_line.to_string())
+    let headers = response.split("\r\n\r\n").next().unwrap_or(&response);
+    let first_line = headers.lines().next()?.trim();
+    let (details, indicators) = if first_line.starts_with("HTTP/") {
+        let mut details = vec![first_line.to_string()];
+        for prefix in ["server:", "x-powered-by:"] {
+            if let Some(header) = headers
+                .lines()
+                .find(|line| line.to_ascii_lowercase().starts_with(prefix))
+            {
+                details.push(header.trim().to_string());
+            }
+        }
+        (
+            details.join("; "),
+            if detect_firewall {
+                detect_http_edge_indicators(headers)
+            } else {
+                Vec::new()
+            },
+        )
     } else {
-        first_line.to_string()
+        (first_line.to_string(), Vec::new())
     };
     let details: String = details
         .chars()
         .filter(|character| !character.is_control())
         .take(160)
         .collect();
-    (!details.is_empty()).then_some(details)
+    (!details.is_empty()).then_some(ServiceEvidence {
+        version: Some(details),
+        indicators,
+    })
+}
+
+struct ServiceEvidence {
+    version: Option<String>,
+    indicators: Vec<String>,
+}
+
+const HTTP_EDGE_SIGNATURES: &[(&str, &[&str])] = &[
+    ("Cloudflare edge", &["cf-ray:", "server: cloudflare"]),
+    ("Akamai edge", &["x-akamai-", "akamai-ghost"]),
+    (
+        "Imperva edge/WAF",
+        &["x-iinfo:", "incap_ses", "visid_incap"],
+    ),
+    ("Sucuri edge/WAF", &["x-sucuri-"]),
+    ("F5 edge/WAF", &["x-wa-info:"]),
+    ("Amazon CloudFront edge", &["x-amz-cf-id:", "x-amz-cf-pop:"]),
+];
+
+fn detect_http_edge_indicators(headers: &str) -> Vec<String> {
+    let headers = headers.to_ascii_lowercase();
+    let mut indicators = BTreeSet::new();
+    for (product, signatures) in HTTP_EDGE_SIGNATURES {
+        if signatures
+            .iter()
+            .any(|signature| headers.contains(signature))
+        {
+            indicators.insert(format!(
+                "Possible {product} header signature; this does not confirm WAF functionality or identify a version."
+            ));
+        }
+    }
+    if headers
+        .lines()
+        .any(|line| line.starts_with("x-waf-") || line.starts_with("x-firewall-"))
+    {
+        indicators.insert(
+            "Possible generic WAF/firewall header; vendor and function are unverified.".to_string(),
+        );
+    }
+    if headers.contains("via:")
+        || headers.contains("x-cache:")
+        || headers.contains("x-proxy-cache:")
+        || headers.contains("x-served-by:")
+    {
+        indicators
+            .insert("Possible reverse proxy or cache indicated by response headers.".to_string());
+    }
+    indicators.into_iter().collect()
 }
 
 pub async fn scan_udp(
@@ -363,6 +467,7 @@ async fn probe_udp(target: IpAddr, port: u16, timeout_duration: Duration) -> Sca
         port,
         service: service_name(port),
         version: None,
+        indicators: Vec::new(),
         state,
         latency_ms: started.elapsed().as_millis(),
         reason,
@@ -453,6 +558,14 @@ pub fn make_report(results: Vec<ScanResult>, target_count: usize) -> ScanReport 
             closed,
             filtered,
             open_filtered,
+            filtering_assessment: if filtered + open_filtered == 0 {
+                "No filtering signal observed; this does not rule out a firewall.".to_string()
+            } else {
+                format!(
+                    "{} probe(s) were filtered or inconclusive; firewall rules, host policy, routing, or packet loss may explain the result. No device or version is identified.",
+                    filtered + open_filtered
+                )
+            },
         },
         results,
     }
@@ -571,16 +684,40 @@ mod tests {
             let mut request = [0; 256];
             let _ = stream.read(&mut request).await.unwrap();
             stream
-                .write_all(b"HTTP/1.0 200 OK\r\nServer: netmapper-test/1.0\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.0 200 OK\r\nServer: netmapper-test/1.0\r\nX-Powered-By: Rust\r\nCF-Ray: test123\r\n\r\n",
+                )
                 .await
                 .unwrap();
         });
 
-        let version = identify_tcp_service(address, 80, Duration::from_secs(1)).await;
+        let evidence = identify_tcp_service(address, 80, Duration::from_secs(1), false)
+            .await
+            .unwrap();
         server.await.unwrap();
         assert_eq!(
-            version.as_deref(),
-            Some("HTTP/1.0 200 OK; Server: netmapper-test/1.0")
+            evidence.version.as_deref(),
+            Some("HTTP/1.0 200 OK; Server: netmapper-test/1.0; X-Powered-By: Rust")
         );
+        assert!(evidence.indicators.is_empty());
+    }
+
+    #[test]
+    fn finds_known_http_edge_signatures_without_claiming_certainty() {
+        let indicators = detect_http_edge_indicators(
+            "HTTP/1.1 403 Forbidden\r\nCF-Ray: abc123\r\nVia: cache\r\n\r\n",
+        );
+        assert!(indicators
+            .iter()
+            .any(|value| value.contains("Cloudflare edge")));
+        assert!(indicators
+            .iter()
+            .any(|value| value.contains("Possible reverse proxy")));
+        assert!(indicators.iter().all(|value| value.contains("Possible")));
+    }
+
+    #[test]
+    fn ignores_unmatched_headers_for_http_edge_detection() {
+        assert!(detect_http_edge_indicators("HTTP/1.1 200 OK\r\nDate: today\r\n\r\n").is_empty());
     }
 }

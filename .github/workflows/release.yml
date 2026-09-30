@@ -14,10 +14,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Verify tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION=$(awk -F '"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)
+          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Tag version $TAG_VERSION does not match Cargo.toml version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+      - name: Prepare version-specific release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          printf '## Netmapper %s\n\n' "$VERSION" > "$RUNNER_TEMP/netmapper-release-notes.md"
+          awk -v heading="## $VERSION" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md >> "$RUNNER_TEMP/netmapper-release-notes.md"
       - name: Build Debian package
         run: ./scripts/build-deb.sh
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
-          name: netmapper v1.2.0
-          files: dist/netmapper.dpkg
+          name: "netmapper ${{ github.ref_name }}"
+          body_path: ${{ runner.temp }}/netmapper-release-notes.md
+          files: dist/netmapperv1_*.deb

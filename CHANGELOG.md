@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1
+
+- Problem solved: scan output did not distinguish possible edge/WAF clues from confirmed firewall identification, and filtered results lacked an explicit uncertainty summary.
+- Added opt-in `--firewall-detection` for heuristic HTTP header signatures and filtering observations in table/JSON reports.
+- Added `X-Powered-By` to captured HTTP service evidence; product matches remain possible indicators, not verified fingerprints.
+- Changed GitHub release naming to follow the pushed version tag.
+
 ## 1.2.0
 
 - Add bounded UDP scanning with `open`, `closed`, `filtered`, and `open|filtered` states.

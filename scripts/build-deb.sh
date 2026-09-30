@@ -6,8 +6,10 @@ VERSION=$(awk -F '"' '$1 ~ /^version = / { print $2; exit }' "$ROOT/Cargo.toml")
 ARCH=$(dpkg --print-architecture)
 STAGING=$(mktemp -d)
 OUTPUT_DIR="$ROOT/dist"
-OUTPUT="$OUTPUT_DIR/netmapper.dpkg"
-PARENT_OUTPUT="$ROOT/../netmapper.dpkg"
+OUTPUT="$OUTPUT_DIR/netmapperv1_${VERSION}_${ARCH}.deb"
+LEGACY_OUTPUT="$OUTPUT_DIR/netmapper.dpkg"
+PARENT_OUTPUT="$ROOT/../netmapperv1_${VERSION}_${ARCH}.deb"
+PARENT_LEGACY_OUTPUT="$ROOT/../netmapper.dpkg"
 BINARY="$ROOT/target/release/netmapper"
 
 if [ -z "$VERSION" ]; then
@@ -42,6 +44,10 @@ sed -e "s/@VERSION@/$VERSION/g" -e "s/@ARCH@/$ARCH/g" \
 sed -i "s/@GLIBC_VERSION@/$GLIBC_VERSION/g" "$STAGING/DEBIAN/control"
 printf '\n' >> "$STAGING/DEBIAN/control"
 dpkg-deb --root-owner-group --build "$STAGING" "$OUTPUT"
+install -m 0644 "$OUTPUT" "$LEGACY_OUTPUT"
 install -m 0644 "$OUTPUT" "$PARENT_OUTPUT"
+install -m 0644 "$OUTPUT" "$PARENT_LEGACY_OUTPUT"
 printf 'Created %s\n' "$OUTPUT"
-printf 'Copied standalone package to %s\n' "$PARENT_OUTPUT"
+printf 'Created compatibility copy %s\n' "$LEGACY_OUTPUT"
+printf 'Copied versioned package to %s\n' "$PARENT_OUTPUT"
+printf 'Copied compatibility package to %s\n' "$PARENT_LEGACY_OUTPUT"

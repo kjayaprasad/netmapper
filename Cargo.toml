@@ -1,6 +1,6 @@
 [package]
 name = "netmapper"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "Independent, bounded TCP and UDP network scanner"
 readme = "README.md"

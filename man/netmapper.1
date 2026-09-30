@@ -1,4 +1,4 @@
-.TH NETMAPPER 1 "2026-09-30" "netmapper 1.2.0" "User Commands"
+.TH NETMAPPER 1 "2026-09-30" "netmapper 1.2.1" "User Commands"
 .SH NAME
 netmapper \- independent bounded TCP and UDP network scanner
 .SH SYNOPSIS
@@ -9,6 +9,7 @@ netmapper \- independent bounded TCP and UDP network scanner
 [\fB\-p\fR \fIports\fR | \fB\-\-top-ports\fR \fIn\fR | \fB\-\-all-ports\fR]
 [\fB\-\-scan-mode\fR \fItcp|udp|both\fR]
 [\fB\-s\fR]
+[\fB\-\-firewall-detection\fR]
 [\fB\-\-format\fR \fItable|json\fR]
 [\fB\-o\fR \fIfile\fR]
 .SH DESCRIPTION
@@ -43,6 +44,9 @@ Per-probe timeout, from 50 to 60000 milliseconds. Default: 1000.
 .TP
 .BR \-s , \ \-\-service-detection
 Collect an HTTP response header or a passive TCP banner from open TCP ports. This is not comprehensive service fingerprinting.
+.TP
+.BR \-\-firewall-detection
+Inspect supported plaintext HTTP response headers for possible WAF/CDN/proxy signatures and include uncertain filtering observations. Requires TCP. Header matches are heuristic and do not confirm a product or version.
 .TP
 .BR \ \-\-format \ format
 Output as table (default) or JSON. Interactive table output highlights port numbers in orange.
@@ -81,7 +85,10 @@ Scan all TCP ports:
 .TP
 Collect TCP banner evidence and write a JSON report:
 .B netmapper -t 192.0.2.15 -p 22,80,443 -s --format json -o scan.json
+.TP
+Inspect HTTP headers for possible edge/WAF indicators:
+.B netmapper -t 192.0.2.15 -p 80,8080 --firewall-detection
 .SH LIMITATIONS
-The built-in scanner is a bounded inventory scanner. It does not currently match all Nmap features. TCP connect probes can complete connections on open ports. UDP silence is ambiguous; the built-in DNS and NTP probes are limited, and other UDP ports receive an empty datagram. Results depend on routing, firewalls, packet loss, and remote rate limiting. Scanning may trigger monitoring or network policy controls.
+The built-in scanner is a bounded inventory scanner. It does not currently match all Nmap features. Firewall/WAF observations are heuristic and limited to plaintext HTTP headers and scan outcomes; no device or version is identified. TCP connect probes can complete connections on open ports. UDP silence is ambiguous; the built-in DNS and NTP probes are limited, and other UDP ports receive an empty datagram. Results depend on routing, firewalls, packet loss, and remote rate limiting. Scanning may trigger monitoring or network policy controls.
 .SH SEE ALSO
 .BR ip (8)
