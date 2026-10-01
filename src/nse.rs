@@ -18,12 +18,13 @@ use tokio::{
 };
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
+const MAX_LIBRARY_MODULE_BYTES: u64 = 1024 * 1024;
 const MAX_SCRIPT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCRIPT_INSTRUCTIONS: u32 = 100;
 const SCRIPT_INSTRUCTION_INTERVAL: u32 = 10_000;
 const MAX_OUTPUT_CHARS: usize = 2_048;
 const MAX_HTTP_RESPONSE_BYTES: usize = 32 * 1024;
-pub const DEFAULT_NSE_SCRIPT_DIRECTORY: &str = "/usr/share/nmap/scripts";
+pub const DEFAULT_NSE_SCRIPT_DIRECTORY: &str = "/usr/share/netmapper/nse/scripts";
 pub const MAX_NSE_EXECUTIONS: usize = 4_096;
 
 pub fn list_nse_scripts(script_directory: &Path) -> Result<Vec<String>> {
@@ -194,7 +195,16 @@ pub fn run_nse_file(
     }
     let source = fs::read_to_string(&canonical_path)
         .with_context(|| format!("could not read NSE script {name}"))?;
-    run_nse_source(name, &source, target, port_number, service, response)
+    let library_directory = root.parent().map(|parent| parent.join("nselib"));
+    run_nse_source(
+        name,
+        &source,
+        target,
+        port_number,
+        service,
+        response,
+        library_directory.as_deref(),
+    )
 }
 
 fn run_nse_source(
@@ -204,6 +214,7 @@ fn run_nse_source(
     port_number: u16,
     service: &str,
     response: &ScriptHttpResponse,
+    library_directory: Option<&Path>,
 ) -> Result<Option<String>> {
     let lua = Lua::new_with(
         StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8,
@@ -308,17 +319,25 @@ fn run_nse_source(
     let table_module: Table = globals.get("table")?;
     let math_module: Table = globals.get("math")?;
     let utf8_module: Table = globals.get("utf8")?;
-    let require = lua.create_function(move |_, name: String| match name.as_str() {
-        "http" => Ok(http_module.clone()),
-        "shortport" => Ok(shortport_module.clone()),
-        "stdnse" => Ok(stdnse_module.clone()),
-        "string" => Ok(string_module.clone()),
-        "table" => Ok(table_module.clone()),
-        "math" => Ok(math_module.clone()),
-        "utf8" => Ok(utf8_module.clone()),
-        _ => Err(mlua::Error::RuntimeError(format!(
-            "unsupported NSE module: {name}"
-        ))),
+    let module_cache = lua.create_table()?;
+    let library_directory = library_directory.map(Path::to_path_buf);
+    let require = lua.create_function(move |lua, name: String| match name.as_str() {
+        "http" => Ok(Value::Table(http_module.clone())),
+        "shortport" => Ok(Value::Table(shortport_module.clone())),
+        "stdnse" => Ok(Value::Table(stdnse_module.clone())),
+        "string" => Ok(Value::Table(string_module.clone())),
+        "table" => Ok(Value::Table(table_module.clone())),
+        "math" => Ok(Value::Table(math_module.clone())),
+        "utf8" => Ok(Value::Table(utf8_module.clone())),
+        _ => {
+            let cached: Value = module_cache.get(name.as_str())?;
+            if !matches!(cached, Value::Nil) {
+                return Ok(cached);
+            }
+            let module = load_nselib_module(lua, library_directory.as_deref(), &name)?;
+            module_cache.set(name, module.clone())?;
+            Ok(module)
+        }
     })?;
     globals.set("require", require)?;
     globals.set("SCRIPT_NAME", script_name)?;
@@ -386,6 +405,47 @@ fn run_nse_source(
         .take(MAX_OUTPUT_CHARS)
         .collect();
     Ok((!rendered.is_empty()).then(|| format!("{script_name}: {rendered}")))
+}
+
+fn load_nselib_module(
+    lua: &Lua,
+    library_directory: Option<&Path>,
+    name: &str,
+) -> mlua::Result<Value> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(mlua::Error::RuntimeError(format!(
+            "unsupported NSE module: {name}"
+        )));
+    }
+    let directory = library_directory
+        .and_then(|directory| directory.canonicalize().ok())
+        .ok_or_else(|| mlua::Error::RuntimeError(format!("unsupported NSE module: {name}")))?;
+    let path = directory
+        .join(format!("{name}.lua"))
+        .canonicalize()
+        .map_err(mlua::Error::external)?;
+    if !path.starts_with(&directory) {
+        return Err(mlua::Error::RuntimeError(format!(
+            "NSE module path escapes nselib: {name}"
+        )));
+    }
+    let metadata = fs::metadata(&path).map_err(mlua::Error::external)?;
+    if metadata.len() > MAX_LIBRARY_MODULE_BYTES {
+        return Err(mlua::Error::RuntimeError(format!(
+            "NSE module {name} exceeds the 1 MiB size limit"
+        )));
+    }
+    let source = fs::read_to_string(path).map_err(mlua::Error::external)?;
+    let module = lua.load(&source).set_name(name).eval::<Value>()?;
+    Ok(if matches!(module, Value::Nil) {
+        Value::Boolean(true)
+    } else {
+        module
+    })
 }
 
 fn http_response_table(lua: &Lua, response: &ScriptHttpResponse) -> mlua::Result<Table> {
@@ -465,10 +525,55 @@ mod tests {
                 return output
             end
         "#;
-        let output = run_nse_source("fixture", source, "192.0.2.10", 80, "http", &response())
-            .unwrap()
-            .unwrap();
+        let output = run_nse_source(
+            "fixture",
+            source,
+            "192.0.2.10",
+            80,
+            "http",
+            &response(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert!(output.contains("fixture/1.0"));
+    }
+
+    #[test]
+    fn loads_lua_modules_from_the_configured_nselib_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "netmapper-nselib-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("fixture.lua"),
+            r#"return {label = "loaded from nselib"}"#,
+        )
+        .unwrap();
+        let source = r#"
+            local fixture = require "fixture"
+            categories = {"safe"}
+            portrule = function() return true end
+            action = function() return fixture.label end
+        "#;
+        let output = run_nse_source(
+            "module-fixture",
+            source,
+            "192.0.2.10",
+            80,
+            "http",
+            &response(),
+            Some(&directory),
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(output.contains("loaded from nselib"));
     }
 
     #[test]
@@ -478,9 +583,16 @@ mod tests {
             portrule = function() return true end
             action = function() return "should not run" end
         "#;
-        let intrusive_error =
-            run_nse_source("intrusive", intrusive, "127.0.0.1", 80, "http", &response())
-                .unwrap_err();
+        let intrusive_error = run_nse_source(
+            "intrusive",
+            intrusive,
+            "127.0.0.1",
+            80,
+            "http",
+            &response(),
+            None,
+        )
+        .unwrap_err();
         assert!(format!("{intrusive_error:#}").contains("intrusive category"));
 
         let unsupported = r#"
@@ -496,6 +608,7 @@ mod tests {
             80,
             "http",
             &response(),
+            None,
         )
         .unwrap_err();
         assert!(format!("{unsupported_error:#}").contains("unsupported NSE module"));
@@ -508,8 +621,8 @@ mod tests {
             portrule = function() return true end
             action = function() while true do end end
         "#;
-        let error =
-            run_nse_source("loop", infinite, "127.0.0.1", 80, "http", &response()).unwrap_err();
+        let error = run_nse_source("loop", infinite, "127.0.0.1", 80, "http", &response(), None)
+            .unwrap_err();
         assert!(format!("{error:#}").contains("instruction limit"));
     }
 

@@ -1,4 +1,4 @@
-.TH NETMAPPER 1 "2026-10-01" "netmapper 2.0.0" "User Commands"
+.TH NETMAPPER 1 "2026-10-01" "netmapper 2.1.0" "User Commands"
 .SH NAME
 netmapper \- independent bounded TCP and UDP network scanner
 .SH SYNOPSIS
@@ -21,7 +21,7 @@ netmapper \- independent bounded TCP and UDP network scanner
 .B netmapper
 is an independent network scanner. It resolves IPv4/IPv6 addresses, CIDR networks, and DNS names, then uses bounded TCP connect or UDP request/response probes. Linux users can opt into raw IPv4 SYN scans and UDP traceroute with CAP_NET_RAW or root privileges. It can collect limited HTTP or passive TCP banner evidence, run read-only HTTP checks or sandboxed NSE scripts, and emit a terminal table or JSON report.
 .PP
-Netmapper does not invoke the Nmap executable. NSE support uses an embedded Lua compatibility subset and defaults to /usr/share/nmap/scripts. Unsupported Nmap APIs and blocked intrusive scripts are reported. Netmapper does not claim full Nmap feature parity or 99% vulnerability-detection accuracy.
+Netmapper does not invoke the Nmap executable. Debian packages include the NSE corpus under /usr/share/netmapper/nse; the embedded Lua engine supports a compatibility subset. Unsupported Nmap APIs and blocked intrusive scripts are reported. Netmapper does not claim full Nmap feature parity or 99% vulnerability-detection accuracy.
 .PP
 Only scan systems and networks that you own or are explicitly authorized to assess.
 .SH OPTIONS
@@ -63,10 +63,10 @@ Collect supported plaintext HTTP response headers or passive TCP banners from op
 Run a named .nse script from the configured script directory using the embedded Lua compatibility engine.
 .TP
 .BR \-nS
-Try all .nse scripts under /usr/share/nmap/scripts on matching open TCP ports. Intrusive categories are blocked and unsupported APIs are reported.
+Try all bundled .nse scripts under /usr/share/netmapper/nse/scripts on matching open TCP ports. Intrusive categories are blocked and unsupported APIs are reported.
 .TP
 .BR \-\-nse-script-dir \ directory
-Set the NSE script directory. Default: /usr/share/nmap/scripts. The Nmap executable is not invoked.
+Set the NSE script directory. Default: /usr/share/netmapper/nse/scripts. The Nmap executable is not invoked.
 .TP
 .BR \-\-firewall-detection
 Inspect supported plaintext HTTP response headers for possible WAF/CDN/proxy signatures and include uncertain filtering observations. Requires TCP. Header matches are heuristic and do not confirm a product or version.

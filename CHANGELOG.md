@@ -1,13 +1,22 @@
 # Changelog
 
+## 2.1.0
+
+- Bundled the available NSE script and Lua library corpus in Debian packages under `/usr/share/netmapper/nse/`.
+- Added sandboxed loading of pure-Lua modules from the bundled `nselib` directory; unsupported native Nmap APIs remain unavailable.
+- Changed table output to show open and filtered ports, with open ports first, while omitting closed rows.
+- Documented full-range port scanning and high-numbered explicit ports; `--all-ports` scans ports 1-65535.
+- Retained upstream Nmap copyright information alongside the bundled corpus.
+
 ## 2.0.0
 
 - Problem addressed: Netmapper previously lacked raw packet TCP scanning, route discovery, target-oriented scan profiles, and any native path for running compatible Nmap script files.
 - Public history through the last published release: 0.1.0 established bounded TCP scanning and structured output; 1.2.0 added UDP state detection and full-port selection; 1.2.1 clarified uncertain firewall/WAF observations. The intervening 1.2.2 work was not tagged as a public release and is included here in 2.0.0.
 - Changes since v1.2.1: added Linux/IPv4 SYN scanning, low-confidence OS-family hints, UDP traceroute, target profiles, embedded sandboxed NSE-subset support, alternate HTTP probing on port 3000, and the `netmapperv2` Debian package identity/version.
-- Added a vendored Lua 5.4 runtime with memory/instruction limits, default `.nse` discovery in `/usr/share/nmap/scripts/`, named-script selection, and the `-nS` all-scripts switch. The Nmap executable is not invoked.
+- Added a vendored Lua 5.4 runtime with memory/instruction limits, named-script selection, and the `-nS` all-scripts switch. The engine used the installed `/usr/share/nmap/scripts/` corpus when available; the Nmap executable is not invoked.
 - Added raw SYN reply correlation and measured RTT, table/JSON traceroute output, profile-plus-custom-port selection, and updated 2.0.0 Debian packaging.
 - Fixed alternate HTTP service detection on TCP/3000 after a Next.js lab service was previously reported as unknown; added a loopback regression test.
+- Displayed only open ports in the default table; `--show-all` exposed other states while JSON retained every result.
 - Renamed the Debian package to `netmapperv2` with Debian version `2.0.0.0`; Cargo remains at SemVer `2.0.0` and the public major-alias Git tag is `v2`. The package declares replacement of the prior `netmapperv1` package.
 - Impact: expands standalone reconnaissance and evidence collection for authorized assessments while preserving connect/UDP defaults and explicit uncertainty in the findings.
 - Known issues carried forward: NSE compatibility is a subset and many scripts requiring Nmap-specific APIs will be reported unsupported; disruptive categories are blocked; raw packet features are Linux/IPv4-only; OS hints and service evidence remain heuristic and are not guaranteed 99% accurate.
@@ -18,7 +27,7 @@
 - Added bounded Linux IPv4 raw SYN scanning and low-confidence OS-family hints from reply TTL/window values.
 - Added opt-in IPv4 UDP traceroute and table/JSON hop reporting.
 - Added `quick`, `web`, `database`, `infrastructure`, and `full` profiles; `-p` can add ports while preserving existing selectors.
-- Added a sandboxed embedded Lua NSE compatibility engine, defaulting to `/usr/share/nmap/scripts/`; `-nS` selects all discovered scripts and `--nse-script` selects one.
+- Added a sandboxed embedded Lua NSE compatibility engine; `-nS` selects all discovered scripts and `--nse-script` selects one.
 - Blocked intrusive NSE categories and bounded script execution; unsupported Nmap APIs are reported rather than claimed as completed.
 - Retained connect/UDP defaults and documented that service/OS/vulnerability results are not comprehensive or guaranteed 99% accurate.
 

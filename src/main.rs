@@ -1,4 +1,6 @@
-use std::{ffi::OsString, fs, io::IsTerminal, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet, ffi::OsString, fs, io::IsTerminal, path::PathBuf, time::Duration,
+};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
@@ -52,7 +54,7 @@ enum ScriptOption {
     version,
     about = "Independent, bounded TCP and UDP network scanner",
     long_about = "Resolve IP addresses, CIDRs, and DNS names, then scan selected TCP and/or UDP ports with bounded probes. Optional service detection collects protocol banners; firewall detection reports heuristic HTTP edge and filtering indicators.",
-    after_long_help = "Use -nS to try all .nse scripts in /usr/share/nmap/scripts on matching open TCP ports; unsupported scripts are reported and intrusive categories are blocked.\n\nOnly scan networks and systems you own or are explicitly authorized to assess. Netmapper is an independent scanner and does not invoke or require Nmap."
+    after_long_help = "Use -nS to try all .nse scripts in /usr/share/netmapper/nse/scripts on matching open TCP ports; unsupported scripts are reported and intrusive categories are blocked.\n\nOnly scan networks and systems you own or are explicitly authorized to assess. Netmapper is an independent scanner and does not invoke or require Nmap."
 )]
 struct Args {
     /// Authorized IP address, CIDR network, or DNS name. Repeat for multiple targets.
@@ -116,7 +118,7 @@ struct Args {
     #[arg(long = "nse-script", value_name = "NAME", action = clap::ArgAction::Append)]
     nse_scripts: Vec<String>,
 
-    /// Script directory; defaults to /usr/share/nmap/scripts.
+    /// Script directory; defaults to /usr/share/netmapper/nse/scripts.
     #[arg(long = "nse-script-dir", default_value = DEFAULT_NSE_SCRIPT_DIRECTORY, value_name = "DIR")]
     nse_script_directory: PathBuf,
 
@@ -272,8 +274,9 @@ async fn main() -> Result<()> {
         }
     }
     let report = make_report_with_traceroutes(results, targets.len(), traceroutes);
+    let color_output = args.output.is_none() && std::io::stdout().is_terminal();
     let output = match format {
-        OutputFormat::Table => format_table(&report, std::io::stdout().is_terminal()),
+        OutputFormat::Table => format_table(&report, color_output),
         OutputFormat::Json => serde_json::to_string_pretty(&report)?,
     };
 
@@ -299,13 +302,13 @@ fn normalize_nse_all_flag(arguments: impl IntoIterator<Item = OsString>) -> Vec<
         .collect()
 }
 
-fn format_port_cell(port: u16, color: bool, width: usize) -> String {
-    let digits = port.to_string();
-    let padding = " ".repeat(width.saturating_sub(digits.len()));
+fn format_port_cell(port: u16, protocol: &str, color: bool, width: usize) -> String {
+    let label = format!("{port}/{protocol}");
+    let padding = " ".repeat(width.saturating_sub(label.len()));
     if color {
-        format!("\x1b[38;5;208m{digits}\x1b[0m{padding}")
+        format!("\x1b[31m{label}\x1b[0m{padding}")
     } else {
-        format!("{digits}{padding}")
+        format!("{label}{padding}")
     }
 }
 
@@ -346,39 +349,87 @@ fn profile_ports(profile: ScanProfile) -> Vec<u16> {
 }
 
 fn format_table(report: &netmapper::ScanReport, color_ports: bool) -> String {
-    let mut output =
-        String::from("TARGET          PROTO PORT   STATE          SERVICE          VERSION                                  OS HINT                                           LATENCY   REASON  INDICATORS\n");
-    for result in &report.results {
-        let reason = result.reason.as_deref().unwrap_or("-");
-        let version = result.version.as_deref().unwrap_or("-");
-        let os_hint = result.os_hint.as_deref().unwrap_or("-");
-        let indicators = if result.indicators.is_empty() {
-            "-".to_string()
-        } else {
-            result.indicators.join("; ")
-        };
-        let port = format_port_cell(result.port, color_ports, 6);
-        output.push_str(&format!(
-            "{:<15} {:<5} {} {:<14} {:<16} {:<40} {:<48} {:>5} ms  {}  {}\n",
-            result.target,
-            result.protocol,
-            port,
-            match result.state {
+    let mut output = String::new();
+    let targets = report
+        .results
+        .iter()
+        .map(|result| result.target)
+        .collect::<BTreeSet<_>>();
+
+    for target in targets {
+        output.push_str(&format!("\nScan report for {target}\n"));
+        output.push_str("PORT         STATE      SERVICE          VERSION\n");
+        let mut visible_results = report
+            .results
+            .iter()
+            .filter(|result| {
+                result.target == target
+                    && matches!(
+                        result.state,
+                        netmapper::PortState::Open
+                            | netmapper::PortState::Filtered
+                            | netmapper::PortState::OpenFiltered
+                    )
+            })
+            .collect::<Vec<_>>();
+        visible_results.sort_by_key(|result| {
+            (
+                if result.state == netmapper::PortState::Open {
+                    0
+                } else {
+                    1
+                },
+                result.protocol,
+                result.port,
+            )
+        });
+        for result in &visible_results {
+            let is_open = result.state == netmapper::PortState::Open;
+            let port = format_port_cell(result.port, result.protocol, color_ports && is_open, 12);
+            let state = match result.state {
                 netmapper::PortState::Open => "open",
                 netmapper::PortState::Closed => "closed",
                 netmapper::PortState::Filtered => "filtered",
                 netmapper::PortState::OpenFiltered => "open|filtered",
-            },
-            result.service,
-            version,
-            os_hint,
-            result.latency_ms,
-            reason,
-            indicators
-        ));
+            };
+            output.push_str(&format!(
+                "{port} {:<10} {:<16} {}\n",
+                state,
+                result.service,
+                result.version.as_deref().unwrap_or("-")
+            ));
+            if let Some(os_hint) = result.os_hint.as_deref() {
+                output.push_str(&format!("  OS hint: {os_hint}\n"));
+            }
+            for indicator in &result.indicators {
+                output.push_str(&format!("  | {indicator}\n"));
+            }
+            if let Some(reason) = result.reason.as_deref() {
+                output.push_str(&format!("  Reason: {reason}\n"));
+            }
+        }
+        let closed_count = report
+            .results
+            .iter()
+            .filter(|result| {
+                result.target == target && result.state == netmapper::PortState::Closed
+            })
+            .count();
+        if closed_count > 0 {
+            output.push_str(&format!(
+                "Not shown: {closed_count} closed port{}\n",
+                if closed_count == 1 { "" } else { "s" }
+            ));
+        }
+        if visible_results.is_empty() {
+            output.push_str("No open or filtered ports found.\n");
+        }
+    }
+    if report.results.is_empty() {
+        output.push_str("No scan results.\n");
     }
     output.push_str(&format!(
-        "\n{} target(s), {} probe(s): {} open, {} closed, {} filtered, {} open|filtered\n",
+        "\nNetmapper done: {} target(s), {} probe(s); {} open, {} closed, {} filtered, {} open|filtered.\n",
         report.summary.targets,
         report.summary.probes,
         report.summary.open,
@@ -417,13 +468,71 @@ mod tests {
 
     #[test]
     fn colors_only_the_port_value_when_enabled() {
-        let port = format_port_cell(443, true, 6);
-        assert_eq!(port, "\x1b[38;5;208m443\x1b[0m   ");
+        let port = format_port_cell(443, "tcp", true, 12);
+        assert_eq!(port, "\x1b[31m443/tcp\x1b[0m     ");
     }
 
     #[test]
     fn leaves_port_plain_when_color_is_disabled() {
-        assert_eq!(format_port_cell(443, false, 6), "443   ");
+        assert_eq!(format_port_cell(443, "tcp", false, 12), "443/tcp     ");
+    }
+
+    fn table_test_report() -> netmapper::ScanReport {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let target = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let result = |port, state| netmapper::ScanResult {
+            target,
+            protocol: "tcp",
+            port,
+            service: "http",
+            version: None,
+            os_hint: None,
+            indicators: Vec::new(),
+            state,
+            latency_ms: 1,
+            reason: None,
+        };
+        netmapper::ScanReport {
+            scanner: "netmapper",
+            version: "2.1.0",
+            summary: netmapper::ScanSummary {
+                targets: 1,
+                probes: 3,
+                open: 1,
+                closed: 1,
+                filtered: 1,
+                open_filtered: 0,
+                filtering_assessment: "test".to_string(),
+            },
+            results: vec![
+                result(80, netmapper::PortState::Open),
+                result(81, netmapper::PortState::Closed),
+                result(82, netmapper::PortState::Filtered),
+            ],
+            traceroutes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn table_shows_open_and_filtered_ports_with_open_first() {
+        let output = format_table(&table_test_report(), true);
+        assert!(output.contains("\x1b[31m80/tcp\x1b[0m"));
+        assert!(!output.contains("81/tcp"));
+        assert!(output.contains("82/tcp"));
+        assert!(output.find("80/tcp").unwrap() < output.find("82/tcp").unwrap());
+        assert!(output.contains("Not shown: 1 closed port"));
+    }
+
+    #[test]
+    fn table_reports_when_only_closed_ports_were_found() {
+        let mut report = table_test_report();
+        report
+            .results
+            .retain(|result| result.state == netmapper::PortState::Closed);
+        let output = format_table(&report, false);
+        assert!(output.contains("No open or filtered ports found."));
+        assert!(!output.contains("81/tcp"));
     }
 
     #[test]
@@ -455,9 +564,13 @@ mod tests {
             select_ports(None, None, Some(5), false, 100).unwrap(),
             common_ports(5)
         );
+        let all_ports = select_ports(None, None, None, true, 100).unwrap();
+        assert_eq!(all_ports.len(), 65_535);
+        assert_eq!(all_ports.first(), Some(&1));
+        assert_eq!(all_ports.last(), Some(&65_535));
         assert_eq!(
-            select_ports(None, None, None, true, 100).unwrap().len(),
-            65_535
+            select_ports(None, Some("10000,65000"), None, false, 100).unwrap(),
+            [10_000, 65_000]
         );
     }
 }
