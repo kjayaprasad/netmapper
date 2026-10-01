@@ -3,12 +3,14 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 VERSION=$(awk -F '"' '$1 ~ /^version = / { print $2; exit }' "$ROOT/Cargo.toml")
+DEB_VERSION="${VERSION}.0"
+PACKAGE_NAME="netmapperv2"
 ARCH=$(dpkg --print-architecture)
 STAGING=$(mktemp -d)
 OUTPUT_DIR="$ROOT/dist"
-OUTPUT="$OUTPUT_DIR/netmapperv1_${VERSION}_${ARCH}.deb"
+OUTPUT="$OUTPUT_DIR/${PACKAGE_NAME}_${DEB_VERSION}_${ARCH}.deb"
 LEGACY_OUTPUT="$OUTPUT_DIR/netmapper.dpkg"
-PARENT_OUTPUT="$ROOT/../netmapperv1_${VERSION}_${ARCH}.deb"
+PARENT_OUTPUT="$ROOT/../${PACKAGE_NAME}_${DEB_VERSION}_${ARCH}.deb"
 PARENT_LEGACY_OUTPUT="$ROOT/../netmapper.dpkg"
 BINARY="$ROOT/target/release/netmapper"
 
@@ -39,7 +41,7 @@ install -m 0755 "$BINARY" "$STAGING/usr/bin/netmapper"
 install -m 0644 "$ROOT/man/netmapper.1" "$STAGING/usr/share/man/man1/netmapper.1"
 install -m 0644 "$ROOT/assets/netmapper.svg" \
     "$STAGING/usr/share/icons/hicolor/scalable/apps/netmapper.svg"
-sed -e "s/@VERSION@/$VERSION/g" -e "s/@ARCH@/$ARCH/g" \
+sed -e "s/@VERSION@/$DEB_VERSION/g" -e "s/@ARCH@/$ARCH/g" \
     "$ROOT/debian/control.in" > "$STAGING/DEBIAN/control"
 sed -i "s/@GLIBC_VERSION@/$GLIBC_VERSION/g" "$STAGING/DEBIAN/control"
 printf '\n' >> "$STAGING/DEBIAN/control"

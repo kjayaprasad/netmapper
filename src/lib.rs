@@ -1,18 +1,36 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::ErrorKind,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
+use pnet_packet::{
+    icmp::{IcmpPacket, IcmpTypes},
+    ip::IpNextHeaderProtocols,
+    ipv4::Ipv4Packet,
+    tcp::{self, MutableTcpPacket, TcpFlags, TcpPacket},
+    udp::{MutableUdpPacket, UdpPacket},
+    Packet,
+};
+use pnet_transport::{
+    ipv4_packet_iter, transport_channel, TransportChannelType, TransportProtocol,
+};
 use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{lookup_host, TcpStream, UdpSocket},
-    task::JoinSet,
+    task::{spawn_blocking, JoinSet},
     time::timeout,
+};
+
+mod nse;
+
+pub use nse::{
+    list_nse_scripts, run_nse_file, run_nse_scripts_for_endpoint, ScriptHttpResponse,
+    DEFAULT_NSE_SCRIPT_DIRECTORY, MAX_NSE_EXECUTIONS,
 };
 
 pub const MAX_TARGETS: usize = 4_096;
@@ -44,6 +62,27 @@ pub enum PortState {
     OpenFiltered,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TcpScanType {
+    Connect,
+    Syn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpScript {
+    SecurityHeaders,
+    ServerHeader,
+    PoweredByHeader,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TcpScanOptions<'a> {
+    pub scan_type: TcpScanType,
+    pub detect_version: bool,
+    pub detect_firewall: bool,
+    pub scripts: &'a [HttpScript],
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ScanResult {
     pub target: IpAddr,
@@ -51,10 +90,26 @@ pub struct ScanResult {
     pub port: u16,
     pub service: &'static str,
     pub version: Option<String>,
+    pub os_hint: Option<String>,
     pub indicators: Vec<String>,
     pub state: PortState,
     pub latency_ms: u128,
     pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TracerouteHop {
+    pub ttl: u8,
+    pub address: Option<IpAddr>,
+    pub latency_ms: Option<u128>,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TracerouteResult {
+    pub target: IpAddr,
+    pub reached: bool,
+    pub hops: Vec<TracerouteHop>,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,10 +129,149 @@ pub struct ScanReport {
     pub version: &'static str,
     pub summary: ScanSummary,
     pub results: Vec<ScanResult>,
+    pub traceroutes: Vec<TracerouteResult>,
 }
 
 pub fn common_ports(count: usize) -> Vec<u16> {
     COMMON_PORTS.iter().copied().take(count).collect()
+}
+
+pub async fn traceroute(
+    target: IpAddr,
+    max_hops: u8,
+    timeout_duration: Duration,
+) -> Result<TracerouteResult> {
+    if max_hops == 0 {
+        bail!("traceroute max hops must be greater than zero");
+    }
+    let IpAddr::V4(target) = target else {
+        bail!("raw UDP traceroute currently supports IPv4 targets only");
+    };
+    spawn_blocking(move || traceroute_ipv4(target, max_hops, timeout_duration))
+        .await
+        .context("traceroute task failed")?
+}
+
+#[cfg(target_os = "linux")]
+fn traceroute_ipv4(
+    target: Ipv4Addr,
+    max_hops: u8,
+    timeout_duration: Duration,
+) -> Result<TracerouteResult> {
+    use std::time::Instant as StdInstant;
+
+    const SOURCE_PORT: u16 = 33_433;
+    let (mut sender, _) = transport_channel(
+        4096,
+        TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Udp)),
+    )
+    .context("could not open raw UDP socket; run with CAP_NET_RAW or as root")?;
+    let (_, mut receiver) = transport_channel(
+        4096,
+        TransportChannelType::Layer3(IpNextHeaderProtocols::Icmp),
+    )
+    .context("could not open ICMP receive socket; run with CAP_NET_RAW or as root")?;
+    let mut packets = ipv4_packet_iter(&mut receiver);
+    let mut hops = Vec::new();
+    let mut reached = false;
+
+    for ttl in 1..=max_hops {
+        let destination_port = SOURCE_PORT + u16::from(ttl);
+        sender
+            .set_ttl(ttl)
+            .with_context(|| format!("could not set traceroute TTL to {ttl}"))?;
+        let mut bytes = [0u8; 8];
+        let mut packet = MutableUdpPacket::new(&mut bytes)
+            .context("could not construct traceroute UDP packet")?;
+        packet.set_source(SOURCE_PORT);
+        packet.set_destination(destination_port);
+        packet.set_length(8);
+        packet.set_checksum(0);
+
+        let started = StdInstant::now();
+        sender
+            .send_to(packet.to_immutable(), IpAddr::V4(target))
+            .context("could not send traceroute probe")?;
+        let deadline = started + timeout_duration;
+        let mut hop = TracerouteHop {
+            ttl,
+            address: None,
+            latency_ms: None,
+            outcome: "timeout".to_string(),
+        };
+
+        loop {
+            let remaining = deadline.saturating_duration_since(StdInstant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Some((ip_packet, _)) = packets.next_with_timeout(remaining)? else {
+                break;
+            };
+            if ip_packet.get_next_level_protocol() != IpNextHeaderProtocols::Icmp {
+                continue;
+            }
+            let Some(icmp_packet) = IcmpPacket::new(ip_packet.payload()) else {
+                continue;
+            };
+            if !matches!(
+                icmp_packet.get_icmp_type(),
+                IcmpTypes::TimeExceeded | IcmpTypes::DestinationUnreachable
+            ) {
+                continue;
+            }
+            let Some(original_ip) = Ipv4Packet::new(icmp_packet.payload()) else {
+                continue;
+            };
+            if original_ip.get_destination() != target
+                || original_ip.get_next_level_protocol() != IpNextHeaderProtocols::Udp
+            {
+                continue;
+            }
+            let Some(original_udp) = UdpPacket::new(original_ip.payload()) else {
+                continue;
+            };
+            if original_udp.get_source() != SOURCE_PORT
+                || original_udp.get_destination() != destination_port
+            {
+                continue;
+            }
+
+            let source = ip_packet.get_source();
+            let code = icmp_packet.get_icmp_code().0;
+            reached = source == target
+                && icmp_packet.get_icmp_type() == IcmpTypes::DestinationUnreachable
+                && code == 3;
+            hop.address = Some(IpAddr::V4(source));
+            hop.latency_ms = Some(started.elapsed().as_millis());
+            hop.outcome = match icmp_packet.get_icmp_type() {
+                IcmpTypes::TimeExceeded => "time-exceeded".to_string(),
+                IcmpTypes::DestinationUnreachable if reached => "reached".to_string(),
+                IcmpTypes::DestinationUnreachable => format!("unreachable (ICMP code {code})"),
+                _ => unreachable!(),
+            };
+            break;
+        }
+        hops.push(hop);
+        if reached {
+            break;
+        }
+    }
+
+    Ok(TracerouteResult {
+        target: IpAddr::V4(target),
+        reached,
+        hops,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn traceroute_ipv4(
+    _target: Ipv4Addr,
+    _max_hops: u8,
+    _timeout_duration: Duration,
+) -> Result<TracerouteResult> {
+    bail!("raw UDP traceroute is currently supported on Linux only")
 }
 
 pub fn parse_ports(specification: &str) -> Result<Vec<u16>> {
@@ -172,6 +366,7 @@ pub async fn scan_tcp_with_detection(
         timeout_duration,
         detect_version,
         false,
+        &[],
     )
     .await
 }
@@ -183,7 +378,53 @@ pub async fn scan_tcp_with_options(
     timeout_duration: Duration,
     detect_version: bool,
     detect_firewall: bool,
+    scripts: &[HttpScript],
 ) -> Result<Vec<ScanResult>> {
+    scan_tcp_with_type(
+        targets,
+        ports,
+        concurrency,
+        timeout_duration,
+        TcpScanOptions {
+            scan_type: TcpScanType::Connect,
+            detect_version,
+            detect_firewall,
+            scripts,
+        },
+    )
+    .await
+}
+
+pub async fn scan_tcp_with_type(
+    targets: &[IpAddr],
+    ports: &[u16],
+    concurrency: usize,
+    timeout_duration: Duration,
+    options: TcpScanOptions<'_>,
+) -> Result<Vec<ScanResult>> {
+    if options.scan_type == TcpScanType::Syn {
+        let mut results = scan_tcp_syn(targets, ports, concurrency, timeout_duration).await?;
+        if options.detect_version || options.detect_firewall || !options.scripts.is_empty() {
+            for result in results
+                .iter_mut()
+                .filter(|result| result.state == PortState::Open)
+            {
+                if let Some(evidence) = identify_tcp_service(
+                    SocketAddr::new(result.target, result.port),
+                    result.port,
+                    timeout_duration,
+                    options.detect_firewall,
+                    options.scripts,
+                )
+                .await
+                {
+                    result.version = evidence.version;
+                    result.indicators.extend(evidence.indicators);
+                }
+            }
+        }
+        return Ok(results);
+    }
     if targets.is_empty() {
         bail!("at least one target address is required");
     }
@@ -216,8 +457,9 @@ pub async fn scan_tcp_with_options(
                 target,
                 port,
                 timeout_duration,
-                detect_version,
-                detect_firewall,
+                options.detect_version,
+                options.detect_firewall,
+                options.scripts.to_vec(),
             ));
         }
         if let Some(result) = jobs.join_next().await {
@@ -228,19 +470,279 @@ pub async fn scan_tcp_with_options(
     Ok(results)
 }
 
+#[cfg(target_os = "linux")]
+async fn scan_tcp_syn(
+    targets: &[IpAddr],
+    ports: &[u16],
+    concurrency: usize,
+    timeout_duration: Duration,
+) -> Result<Vec<ScanResult>> {
+    if targets.is_empty() || ports.is_empty() {
+        bail!("at least one target and one port are required for a SYN scan");
+    }
+    if ports.contains(&0) {
+        bail!("port 0 is not a valid TCP destination port");
+    }
+    if concurrency == 0 {
+        bail!("concurrency must be greater than zero");
+    }
+    let total = targets
+        .len()
+        .checked_mul(ports.len())
+        .context("probe count overflow")?;
+    if total > MAX_PROBES {
+        bail!("scan would run {total} probes; reduce targets or ports (limit: {MAX_PROBES})");
+    }
+    if targets.iter().any(|target| !target.is_ipv4()) {
+        bail!("the initial raw SYN implementation supports IPv4 targets only");
+    }
+
+    let mut results = Vec::with_capacity(total);
+    for target in targets {
+        let target = *target;
+        let ports = ports.to_vec();
+        let concurrency = concurrency.min(1024);
+        let batch = tokio::task::spawn_blocking(move || {
+            scan_ipv4_target_syn(target, &ports, concurrency, timeout_duration)
+        })
+        .await
+        .context("SYN scanner task failed")??;
+        results.extend(batch);
+    }
+    results.sort_by_key(|result| (result.target, result.port));
+    Ok(results)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn scan_tcp_syn(
+    _targets: &[IpAddr],
+    _ports: &[u16],
+    _concurrency: usize,
+    _timeout_duration: Duration,
+) -> Result<Vec<ScanResult>> {
+    bail!("raw SYN scans are currently supported on Linux only")
+}
+
+#[cfg(target_os = "linux")]
+fn scan_ipv4_target_syn(
+    target: IpAddr,
+    ports: &[u16],
+    concurrency: usize,
+    timeout_duration: Duration,
+) -> Result<Vec<ScanResult>> {
+    use std::{
+        net::{SocketAddr, UdpSocket as StdUdpSocket},
+        time::Instant as StdInstant,
+    };
+
+    const SOURCE_PORT_FALLBACK: u16 = 49_999;
+    let target_v4 = match target {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(_) => bail!("raw SYN scans currently support IPv4 only"),
+    };
+    let route_socket = StdUdpSocket::bind("0.0.0.0:0")?;
+    route_socket.connect(SocketAddr::new(target, 33434))?;
+    let source_ip = match route_socket.local_addr()?.ip() {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(_) => bail!("could not select an IPv4 source address for target"),
+    };
+    let source_port = route_socket
+        .local_addr()
+        .map(|address| address.port())
+        .ok()
+        .filter(|port| *port != 0)
+        .unwrap_or(SOURCE_PORT_FALLBACK);
+
+    let (mut sender, _) = transport_channel(
+        4096,
+        TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Tcp)),
+    )
+    .context("could not open raw TCP socket; run with CAP_NET_RAW or as root")?;
+    let (_, mut receiver) = transport_channel(
+        4096,
+        TransportChannelType::Layer3(IpNextHeaderProtocols::Tcp),
+    )
+    .context("could not open raw TCP receive socket; run with CAP_NET_RAW or as root")?;
+    let mut packets = ipv4_packet_iter(&mut receiver);
+    let mut results = Vec::with_capacity(ports.len());
+
+    for port_batch in ports.chunks(concurrency.max(1)) {
+        let mut outstanding = BTreeMap::new();
+        for port in port_batch {
+            let sequence = u32::from(*port) ^ u32::from(source_port);
+            let mut bytes = [0u8; 20];
+            let mut packet = MutableTcpPacket::new(&mut bytes[..])
+                .context("could not construct TCP SYN packet")?;
+            packet.set_source(source_port);
+            packet.set_destination(*port);
+            packet.set_sequence(sequence);
+            packet.set_data_offset(5);
+            packet.set_flags(TcpFlags::SYN);
+            packet.set_window(64240);
+            packet.set_urgent_ptr(0);
+            let checksum = tcp::ipv4_checksum(&packet.to_immutable(), &source_ip, &target_v4);
+            packet.set_checksum(checksum);
+            sender
+                .send_to(packet.to_immutable(), target)
+                .with_context(|| format!("could not send SYN probe to {target}:{port}"))?;
+            outstanding.insert(*port, (StdInstant::now(), sequence));
+        }
+
+        let deadline = StdInstant::now() + timeout_duration;
+        while !outstanding.is_empty() {
+            let remaining = deadline.saturating_duration_since(StdInstant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let received = packets.next_with_timeout(remaining)?;
+            let Some((ip_packet, _)) = received else {
+                break;
+            };
+            if ip_packet.get_source() != target_v4 {
+                continue;
+            }
+            let Some(tcp_packet) = TcpPacket::new(ip_packet.payload()) else {
+                continue;
+            };
+            if tcp_packet.get_destination() != source_port {
+                continue;
+            }
+            let response_port = tcp_packet.get_source();
+            let Some((_, sequence)) = outstanding.get(&response_port) else {
+                continue;
+            };
+            let flags = tcp_packet.get_flags();
+            if flags & TcpFlags::ACK != 0
+                && tcp_packet.get_acknowledgement() != sequence.wrapping_add(1)
+            {
+                continue;
+            }
+            let Some((sent_at, _)) = outstanding.remove(&response_port) else {
+                continue;
+            };
+            let state =
+                if flags & (TcpFlags::SYN | TcpFlags::ACK) == (TcpFlags::SYN | TcpFlags::ACK) {
+                    PortState::Open
+                } else if flags & TcpFlags::RST != 0 {
+                    PortState::Closed
+                } else {
+                    PortState::Filtered
+                };
+            let mut indicators = Vec::new();
+            let os_hint = if state == PortState::Open {
+                indicators.push(format!(
+                    "TCP SYN/ACK observed; reply TTL {} and window {} were used for a low-confidence OS-family estimate.",
+                    ip_packet.get_ttl(),
+                    tcp_packet.get_window()
+                ));
+                send_tcp_reset(
+                    &mut sender,
+                    source_ip,
+                    target_v4,
+                    source_port,
+                    response_port,
+                    tcp_packet.get_sequence(),
+                    tcp_packet.get_acknowledgement(),
+                )?;
+                estimate_os_family(ip_packet.get_ttl(), tcp_packet.get_window())
+            } else {
+                None
+            };
+            results.push(ScanResult {
+                target,
+                protocol: "tcp",
+                port: response_port,
+                service: service_name(response_port),
+                version: None,
+                os_hint,
+                indicators,
+                state,
+                latency_ms: sent_at.elapsed().as_millis(),
+                reason: Some("raw IPv4 TCP SYN response".to_string()),
+            });
+        }
+
+        for port in outstanding.keys().copied() {
+            results.push(ScanResult {
+                target,
+                protocol: "tcp",
+                port,
+                service: service_name(port),
+                version: None,
+                os_hint: None,
+                indicators: vec![
+                    "No SYN response before timeout; open|filtered is ambiguous.".to_string(),
+                ],
+                state: PortState::Filtered,
+                latency_ms: timeout_duration.as_millis(),
+                reason: Some("no TCP SYN response before timeout".to_string()),
+            });
+        }
+    }
+    Ok(results)
+}
+
+#[cfg(target_os = "linux")]
+fn send_tcp_reset(
+    sender: &mut pnet_transport::TransportSender,
+    source_ip: std::net::Ipv4Addr,
+    target_ip: std::net::Ipv4Addr,
+    source_port: u16,
+    target_port: u16,
+    response_sequence: u32,
+    response_acknowledgement: u32,
+) -> Result<()> {
+    let mut bytes = [0u8; 20];
+    let mut packet =
+        MutableTcpPacket::new(&mut bytes[..]).context("could not construct TCP reset")?;
+    packet.set_source(source_port);
+    packet.set_destination(target_port);
+    packet.set_sequence(response_acknowledgement);
+    packet.set_acknowledgement(response_sequence.wrapping_add(1));
+    packet.set_data_offset(5);
+    packet.set_flags(TcpFlags::RST | TcpFlags::ACK);
+    packet.set_window(0);
+    let checksum = tcp::ipv4_checksum(&packet.to_immutable(), &source_ip, &target_ip);
+    packet.set_checksum(checksum);
+    sender
+        .send_to(packet.to_immutable(), IpAddr::V4(target_ip))
+        .context("could not send TCP reset after SYN/ACK")?;
+    Ok(())
+}
+
+fn estimate_os_family(ttl: u8, window: u16) -> Option<String> {
+    let estimated_initial_ttl = match ttl {
+        1..=32 => 32,
+        33..=64 => 64,
+        65..=128 => 128,
+        129..=255 => 255,
+        _ => return None,
+    };
+    let family = match estimated_initial_ttl {
+        32 => "embedded/network-device-like",
+        64 => "Unix/Linux-like",
+        128 => "Windows-like",
+        _ => "network-device/other",
+    };
+    Some(format!(
+        "Low confidence: {family}; observed TTL {ttl} (estimated initial TTL {estimated_initial_ttl}), TCP window {window}. Middleboxes and tuning can change these values."
+    ))
+}
+
 async fn probe(
     target: IpAddr,
     port: u16,
     timeout_duration: Duration,
     detect_version: bool,
     detect_firewall: bool,
+    scripts: Vec<HttpScript>,
 ) -> ScanResult {
     let started = Instant::now();
     let address = SocketAddr::new(target, port);
     let result = timeout(timeout_duration, TcpStream::connect(address)).await;
     let (state, reason) = classify_connect_result(result, timeout_duration);
     let evidence = if (detect_version || detect_firewall) && state == PortState::Open {
-        identify_tcp_service(address, port, timeout_duration, detect_firewall).await
+        identify_tcp_service(address, port, timeout_duration, detect_firewall, &scripts).await
     } else {
         None
     };
@@ -259,6 +761,7 @@ async fn probe(
         port,
         service: service_name(port),
         version: evidence.and_then(|evidence| evidence.version),
+        os_hint: None,
         indicators,
         state,
         latency_ms: started.elapsed().as_millis(),
@@ -271,6 +774,7 @@ async fn identify_tcp_service(
     port: u16,
     timeout_duration: Duration,
     detect_firewall: bool,
+    scripts: &[HttpScript],
 ) -> Option<ServiceEvidence> {
     let mut stream = timeout(timeout_duration, TcpStream::connect(address))
         .await
@@ -307,14 +811,13 @@ async fn identify_tcp_service(
                 details.push(header.trim().to_string());
             }
         }
-        (
-            details.join("; "),
-            if detect_firewall {
-                detect_http_edge_indicators(headers)
-            } else {
-                Vec::new()
-            },
-        )
+        let mut indicators = if detect_firewall {
+            detect_http_edge_indicators(headers)
+        } else {
+            Vec::new()
+        };
+        indicators.extend(run_http_scripts(headers, scripts));
+        (details.join("; "), indicators)
     } else {
         (first_line.to_string(), Vec::new())
     };
@@ -376,6 +879,56 @@ fn detect_http_edge_indicators(headers: &str) -> Vec<String> {
             .insert("Possible reverse proxy or cache indicated by response headers.".to_string());
     }
     indicators.into_iter().collect()
+}
+
+fn run_http_scripts(headers: &str, scripts: &[HttpScript]) -> Vec<String> {
+    let lower_headers = headers.to_ascii_lowercase();
+    let mut findings = Vec::new();
+    for script in scripts {
+        match script {
+            HttpScript::SecurityHeaders => {
+                let missing = [
+                    "content-security-policy:",
+                    "strict-transport-security:",
+                    "x-content-type-options:",
+                    "x-frame-options:",
+                    "referrer-policy:",
+                ]
+                .into_iter()
+                .filter(|header| !lower_headers.contains(header))
+                .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    findings.push(format!(
+                        "http-security-headers (informational): response omitted {}",
+                        missing.join(", ")
+                    ));
+                }
+            }
+            HttpScript::ServerHeader => {
+                if let Some(header) = headers
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("server:"))
+                {
+                    findings.push(format!(
+                        "http-server-header (informational): {}",
+                        header.trim()
+                    ));
+                }
+            }
+            HttpScript::PoweredByHeader => {
+                if let Some(header) = headers
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("x-powered-by:"))
+                {
+                    findings.push(format!(
+                        "http-powered-by-header (informational): {}",
+                        header.trim()
+                    ));
+                }
+            }
+        }
+    }
+    findings
 }
 
 pub async fn scan_udp(
@@ -467,6 +1020,7 @@ async fn probe_udp(target: IpAddr, port: u16, timeout_duration: Duration) -> Sca
         port,
         service: service_name(port),
         version: None,
+        os_hint: None,
         indicators: Vec::new(),
         state,
         latency_ms: started.elapsed().as_millis(),
@@ -532,6 +1086,14 @@ pub fn service_name(port: u16) -> &'static str {
 }
 
 pub fn make_report(results: Vec<ScanResult>, target_count: usize) -> ScanReport {
+    make_report_with_traceroutes(results, target_count, Vec::new())
+}
+
+pub fn make_report_with_traceroutes(
+    results: Vec<ScanResult>,
+    target_count: usize,
+    traceroutes: Vec<TracerouteResult>,
+) -> ScanReport {
     let open = results
         .iter()
         .filter(|result| result.state == PortState::Open)
@@ -568,6 +1130,7 @@ pub fn make_report(results: Vec<ScanResult>, target_count: usize) -> ScanReport 
             },
         },
         results,
+        traceroutes,
     }
 }
 
@@ -691,7 +1254,7 @@ mod tests {
                 .unwrap();
         });
 
-        let evidence = identify_tcp_service(address, 80, Duration::from_secs(1), false)
+        let evidence = identify_tcp_service(address, 80, Duration::from_secs(1), false, &[])
             .await
             .unwrap();
         server.await.unwrap();
@@ -719,5 +1282,35 @@ mod tests {
     #[test]
     fn ignores_unmatched_headers_for_http_edge_detection() {
         assert!(detect_http_edge_indicators("HTTP/1.1 200 OK\r\nDate: today\r\n\r\n").is_empty());
+    }
+
+    #[test]
+    fn runs_only_selected_read_only_http_scripts() {
+        let headers = "HTTP/1.1 200 OK\r\nServer: example/1.0\r\nX-Powered-By: Example\r\n\r\n";
+        let findings = run_http_scripts(
+            headers,
+            &[HttpScript::SecurityHeaders, HttpScript::PoweredByHeader],
+        );
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("http-powered-by-header")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("http-security-headers")));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.contains("http-server-header")));
+    }
+
+    #[test]
+    fn ttl_os_family_hints_are_explicitly_low_confidence() {
+        assert!(estimate_os_family(61, 64240)
+            .unwrap()
+            .contains("Unix/Linux-like"));
+        assert!(estimate_os_family(120, 8192)
+            .unwrap()
+            .contains("Windows-like"));
+        assert!(estimate_os_family(0, 0).is_none());
     }
 }

@@ -39,4 +39,4 @@ jobs:
         with:
           name: "netmapper ${{ github.ref_name }}"
           body_path: ${{ runner.temp }}/netmapper-release-notes.md
-          files: dist/netmapperv1_*.deb
+          files: dist/netmapperv2_*.deb

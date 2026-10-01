@@ -1,10 +1,13 @@
-Package: netmapperv1
+Package: netmapperv2
 Version: @VERSION@
 Section: net
 Priority: optional
 Architecture: @ARCH@
 Maintainer: Netmapper Contributors <netmapper@example.org>
 Depends: libc6 (>= @GLIBC_VERSION@)
+Conflicts: netmapperv1
+Replaces: netmapperv1
 Description: independent bounded TCP and UDP network scanner
- Netmapper resolves IPv4 and IPv6 targets and provides a bounded built-in
- scanner with optional TCP banner collection, JSON output, and full-port scans.
+ Netmapper resolves IPv4 and IPv6 targets and provides bounded TCP/UDP scans,
+ optional IPv4 SYN scanning and traceroute, a sandboxed NSE subset, JSON output,
+ and target-oriented port profiles.

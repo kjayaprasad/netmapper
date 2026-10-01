@@ -1,4 +1,4 @@
-.TH NETMAPPER 1 "2026-09-30" "netmapper 1.2.1" "User Commands"
+.TH NETMAPPER 1 "2026-10-01" "netmapper 2.0.0" "User Commands"
 .SH NAME
 netmapper \- independent bounded TCP and UDP network scanner
 .SH SYNOPSIS
@@ -8,15 +8,20 @@ netmapper \- independent bounded TCP and UDP network scanner
 [\fB\-t\fR \fItarget\fR ...]
 [\fB\-p\fR \fIports\fR | \fB\-\-top-ports\fR \fIn\fR | \fB\-\-all-ports\fR]
 [\fB\-\-scan-mode\fR \fItcp|udp|both\fR]
+[\fB\-\-tcp-scan-type\fR \fIconnect|syn\fR]
+[\fB\-\-profile\fR \fIprofile\fR]
+[\fB\-\-traceroute\fR]
 [\fB\-s\fR]
+[\fB\-\-nse-script\fR \fIname\fR]
+[\fB\-nS\fR]
 [\fB\-\-firewall-detection\fR]
 [\fB\-\-format\fR \fItable|json\fR]
 [\fB\-o\fR \fIfile\fR]
 .SH DESCRIPTION
 .B netmapper
-is an independent network scanner. It resolves IPv4/IPv6 addresses, CIDR networks, and DNS names, then uses bounded TCP connect probes and UDP request/response probes. It can collect limited HTTP or passive TCP banner evidence and emit a terminal table or JSON report.
+is an independent network scanner. It resolves IPv4/IPv6 addresses, CIDR networks, and DNS names, then uses bounded TCP connect or UDP request/response probes. Linux users can opt into raw IPv4 SYN scans and UDP traceroute with CAP_NET_RAW or root privileges. It can collect limited HTTP or passive TCP banner evidence, run read-only HTTP checks or sandboxed NSE scripts, and emit a terminal table or JSON report.
 .PP
-Netmapper does not invoke or require Nmap. It does not currently implement raw-packet scan types, OS fingerprinting, comprehensive service/version fingerprints, traceroute, or an extensible script engine. It does not claim full Nmap feature parity.
+Netmapper does not invoke the Nmap executable. NSE support uses an embedded Lua compatibility subset and defaults to /usr/share/nmap/scripts. Unsupported Nmap APIs and blocked intrusive scripts are reported. Netmapper does not claim full Nmap feature parity or 99% vulnerability-detection accuracy.
 .PP
 Only scan systems and networks that you own or are explicitly authorized to assess.
 .SH OPTIONS
@@ -33,8 +38,17 @@ Select the first 1 to 100 entries from the built-in common-port set. Default: 10
 .BR \-\-all-ports
 Scan ports 1-65535 for selected protocol(s). Scans are limited to one million probes per run.
 .TP
+.BR \-\-profile \ profile
+Choose quick, web, database, infrastructure, or full port presets. The -p option may add extra ports to a profile.
+.TP
 .BR \-\-scan-mode \ mode
 Select tcp (default), udp, or both.
+.TP
+.BR \-\-tcp-scan-type \ type
+Select connect (default) or raw IPv4 syn scanning. SYN scans require Linux and CAP_NET_RAW or root.
+.TP
+.BR \-\-traceroute
+Run an IPv4 UDP traceroute for each target, with a maximum of 30 hops. Requires Linux and CAP_NET_RAW or root.
 .TP
 .BR \-c , \ \-\-concurrency \ n
 Maximum simultaneous probes per protocol, from 1 to 8192. Default: 512.
@@ -43,7 +57,16 @@ Maximum simultaneous probes per protocol, from 1 to 8192. Default: 512.
 Per-probe timeout, from 50 to 60000 milliseconds. Default: 1000.
 .TP
 .BR \-s , \ \-\-service-detection
-Collect an HTTP response header or a passive TCP banner from open TCP ports. This is not comprehensive service fingerprinting.
+Collect supported plaintext HTTP response headers or passive TCP banners from open TCP ports. This is not comprehensive service fingerprinting.
+.TP
+.BR \-\-nse-script \ name
+Run a named .nse script from the configured script directory using the embedded Lua compatibility engine.
+.TP
+.BR \-nS
+Try all .nse scripts under /usr/share/nmap/scripts on matching open TCP ports. Intrusive categories are blocked and unsupported APIs are reported.
+.TP
+.BR \-\-nse-script-dir \ directory
+Set the NSE script directory. Default: /usr/share/nmap/scripts. The Nmap executable is not invoked.
 .TP
 .BR \-\-firewall-detection
 Inspect supported plaintext HTTP response headers for possible WAF/CDN/proxy signatures and include uncertain filtering observations. Requires TCP. Header matches are heuristic and do not confirm a product or version.
@@ -89,6 +112,6 @@ Collect TCP banner evidence and write a JSON report:
 Inspect HTTP headers for possible edge/WAF indicators:
 .B netmapper -t 192.0.2.15 -p 80,8080 --firewall-detection
 .SH LIMITATIONS
-The built-in scanner is a bounded inventory scanner. It does not currently match all Nmap features. Firewall/WAF observations are heuristic and limited to plaintext HTTP headers and scan outcomes; no device or version is identified. TCP connect probes can complete connections on open ports. UDP silence is ambiguous; the built-in DNS and NTP probes are limited, and other UDP ports receive an empty datagram. Results depend on routing, firewalls, packet loss, and remote rate limiting. Scanning may trigger monitoring or network policy controls.
+The scanner does not match all Nmap features. Raw SYN scanning, OS-family hints, and traceroute are IPv4-only and require raw-socket privileges. OS hints and service evidence are heuristic and limited. NSE execution uses a sandboxed subset; scripts that require unsupported APIs will not run. Vulnerability results are not guaranteed 99% accurate. Firewall/WAF observations are heuristic and limited to plaintext HTTP headers and scan outcomes; no device or version is identified. TCP connect probes can complete connections on open ports. UDP silence is ambiguous; built-in DNS and NTP probes are limited, and other UDP ports receive an empty datagram. Results depend on routing, firewalls, packet loss, and remote rate limiting. Scanning may trigger monitoring or network policy controls.
 .SH SEE ALSO
 .BR ip (8)
