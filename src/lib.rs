@@ -36,6 +36,12 @@ pub use nse::{
 pub const MAX_TARGETS: usize = 4_096;
 pub const MAX_PROBES: usize = 1_000_000;
 
+const PLAINTEXT_HTTP_PORTS: &[u16] = &[80, 3000, 8000, 8008, 8080, 8081, 8888];
+
+fn is_plaintext_http_port(port: u16) -> bool {
+    PLAINTEXT_HTTP_PORTS.contains(&port)
+}
+
 const COMMON_PORTS: [u16; 100] = [
     7, 9, 13, 21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 179, 199, 389, 443, 445, 465, 514,
     515, 587, 631, 636, 873, 993, 995, 1_024, 1_025, 1_026, 1_027, 1_028, 1_111, 1_312, 1_433,
@@ -780,7 +786,7 @@ async fn identify_tcp_service(
         .await
         .ok()?
         .ok()?;
-    if matches!(port, 80 | 8000 | 8008 | 8080 | 8081 | 8888) {
+    if is_plaintext_http_port(port) {
         timeout(
             timeout_duration,
             stream.write_all(b"HEAD / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
@@ -1066,6 +1072,7 @@ pub fn service_name(port: u16) -> &'static str {
         143 => "imap",
         389 => "ldap",
         443 => "https",
+        3000 => "http-alt",
         445 => "microsoft-ds",
         587 => "submission",
         631 => "ipp",
@@ -1263,6 +1270,32 @@ mod tests {
             Some("HTTP/1.0 200 OK; Server: netmapper-test/1.0; X-Powered-By: Rust")
         );
         assert!(evidence.indicators.is_empty());
+    }
+
+    #[tokio::test]
+    async fn probes_http_on_alternate_port_3000() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 256];
+            let _ = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request).starts_with("HEAD / HTTP/1.0"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nX-Powered-By: Next.js\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let evidence = identify_tcp_service(address, 3000, Duration::from_secs(1), false, &[])
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            evidence.version.as_deref(),
+            Some("HTTP/1.1 200 OK; X-Powered-By: Next.js")
+        );
+        assert_eq!(service_name(3000), "http-alt");
     }
 
     #[test]

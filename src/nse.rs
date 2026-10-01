@@ -60,7 +60,7 @@ pub async fn run_nse_scripts_for_endpoint(
     service: &str,
     timeout_duration: Duration,
 ) -> Vec<String> {
-    if service != "http" && !matches!(port_number, 80 | 8000 | 8008 | 8080 | 8081 | 8888) {
+    if service != "http" && !super::is_plaintext_http_port(port_number) {
         return vec![
             "NSE engine: skipped; this endpoint is not a supported plaintext HTTP service."
                 .to_string(),
@@ -250,7 +250,8 @@ fn run_nse_source(
             let number: u16 = port.get("number").unwrap_or_default();
             let service: String = port.get("service").unwrap_or_default();
             Ok(service == "http"
-                || matches!(number, 80 | 443 | 8000 | 8008 | 8080 | 8081 | 8443 | 8888))
+                || matches!(number, 443 | 8443)
+                || super::is_plaintext_http_port(number))
         })?,
     )?;
     shortport_module.set(

@@ -3,10 +3,12 @@
 ## 2.0.0
 
 - Problem addressed: Netmapper previously lacked raw packet TCP scanning, route discovery, target-oriented scan profiles, and any native path for running compatible Nmap script files.
-- Public history of known issues addressed: 0.1.0 established bounded TCP scanning and structured output; 1.2.0 added UDP state detection and full-port selection; 1.2.1 clarified uncertain firewall/WAF observations; 1.2.2 added IPv4 SYN scans, low-confidence OS-family hints, traceroute, profiles, and the initial embedded script support.
+- Public history through the last published release: 0.1.0 established bounded TCP scanning and structured output; 1.2.0 added UDP state detection and full-port selection; 1.2.1 clarified uncertain firewall/WAF observations. The intervening 1.2.2 work was not tagged as a public release and is included here in 2.0.0.
+- Changes since v1.2.1: added Linux/IPv4 SYN scanning, low-confidence OS-family hints, UDP traceroute, target profiles, embedded sandboxed NSE-subset support, alternate HTTP probing on port 3000, and the `netmapperv2` Debian package identity/version.
 - Added a vendored Lua 5.4 runtime with memory/instruction limits, default `.nse` discovery in `/usr/share/nmap/scripts/`, named-script selection, and the `-nS` all-scripts switch. The Nmap executable is not invoked.
 - Added raw SYN reply correlation and measured RTT, table/JSON traceroute output, profile-plus-custom-port selection, and updated 2.0.0 Debian packaging.
-- Renamed the Debian package to `netmapperv2` with Debian version `2.0.0.0`; the Cargo version and GitHub release tag remain valid SemVer `2.0.0` / `v2.0.0`. The package declares replacement of the prior `netmapperv1` package.
+- Fixed alternate HTTP service detection on TCP/3000 after a Next.js lab service was previously reported as unknown; added a loopback regression test.
+- Renamed the Debian package to `netmapperv2` with Debian version `2.0.0.0`; Cargo remains at SemVer `2.0.0` and the public major-alias Git tag is `v2`. The package declares replacement of the prior `netmapperv1` package.
 - Impact: expands standalone reconnaissance and evidence collection for authorized assessments while preserving connect/UDP defaults and explicit uncertainty in the findings.
 - Known issues carried forward: NSE compatibility is a subset and many scripts requiring Nmap-specific APIs will be reported unsupported; disruptive categories are blocked; raw packet features are Linux/IPv4-only; OS hints and service evidence remain heuristic and are not guaranteed 99% accurate.
 

@@ -18,15 +18,22 @@ jobs:
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PACKAGE_VERSION=$(awk -F '"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)
-          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
-            echo "Tag version $TAG_VERSION does not match Cargo.toml version $PACKAGE_VERSION" >&2
+          PACKAGE_MAJOR="${PACKAGE_VERSION%%.*}"
+          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ] && [ "$TAG_VERSION" != "$PACKAGE_MAJOR" ]; then
+            echo "Tag version $TAG_VERSION does not match Cargo.toml version $PACKAGE_VERSION or its major alias v$PACKAGE_MAJOR" >&2
             exit 1
           fi
       - name: Prepare version-specific release notes
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          printf '## Netmapper %s\n\n' "$VERSION" > "$RUNNER_TEMP/netmapper-release-notes.md"
-          awk -v heading="## $VERSION" '
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION=$(awk -F '"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)
+          PACKAGE_MAJOR="${PACKAGE_VERSION%%.*}"
+          CHANGELOG_VERSION="$TAG_VERSION"
+          if [ "$TAG_VERSION" = "$PACKAGE_MAJOR" ]; then
+            CHANGELOG_VERSION="$PACKAGE_VERSION"
+          fi
+          printf '## Netmapper %s\n\n' "$CHANGELOG_VERSION" > "$RUNNER_TEMP/netmapper-release-notes.md"
+          awk -v heading="## $CHANGELOG_VERSION" '
             $0 == heading { found = 1; next }
             found && /^## / { exit }
             found { print }

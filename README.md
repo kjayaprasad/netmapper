@@ -17,7 +17,7 @@ Only scan systems and networks that you own or are explicitly authorized to asse
 - Select ports using individual numbers, comma-separated lists, and inclusive ranges; `-p` adds ports to a chosen profile.
 - Start with a built-in set of 100 commonly used ports, select a prefix with `--top-ports`, or scan all ports with `--all-ports`.
 - Send a DNS query to UDP/53 and an NTP request to UDP/123; other UDP ports receive an empty datagram.
-- Optionally collect passive TCP banners and plaintext HTTP response headers with `--service-detection`.
+- Optionally collect passive TCP banners and plaintext HTTP response headers with `--service-detection`, including alternate HTTP port 3000.
 - Estimate broad OS families from observed SYN/ACK TTL and TCP window values; hints are explicitly low-confidence.
 - Run IPv4 UDP traceroute with `--traceroute` and include hop outcomes in table or JSON output.
 - Run selected read-only HTTP checks for security headers, `Server`, and `X-Powered-By` with repeatable `--script` options.
@@ -34,13 +34,23 @@ Only scan systems and networks that you own or are explicitly authorized to asse
 
 Version 2.0.0 consolidates the public fixes and additions recorded in the changelog: bounded TCP scanning, UDP response-state detection, explicit filtering uncertainty, raw SYN probes, best-effort OS hints, traceroute, target-oriented profiles, and an embedded script runtime. This gives assessment teams one native CLI and JSON report path for these supported workflows; it does not replace Nmap where complete service fingerprints, OS databases, IPv6 raw scans, or full NSE behavior are required.
 
+### Changes Since v1.2.1
+
+- Added Linux IPv4 TCP SYN scanning with measured reply latency and cautious OS-family hints; the existing connect scan remains the default.
+- Added IPv4 UDP traceroute with hop data in table and JSON output.
+- Added `quick`, `web`, `database`, `infrastructure`, and `full` profiles; custom `-p` ports can extend a profile.
+- Added an embedded, resource-limited Lua engine for a subset of NSE scripts, using `/usr/share/nmap/scripts/` by default and `-nS` to select the corpus.
+- Improved alternate HTTP detection on TCP/3000, including `X-Powered-By` evidence.
+- Renamed the Debian package to `netmapperv2` version `2.0.0.0`; the Rust/Cargo and Git tag version is `2.0.0`.
+- Retained v1.2.1 TCP/UDP scanning, bounded probe limits, JSON output, and heuristic firewall/WAF reporting.
+
 The tool favors evidence over forced conclusions. A port can remain filtered or inconclusive, OS hints are heuristic, and script compatibility is reported rather than assumed. Do not use a “99% accurate” claim without a representative, independently labeled benchmark.
 
 ### Known Issues And Next Changes
 
 - The Lua engine implements only a small NSE compatibility surface. Scripts requiring unsupported Nmap modules/APIs are skipped and counted; `-nS` selects all files but does not mean every script can run.
 - Raw SYN scanning, OS hints, and traceroute currently support Linux IPv4 only.
-- Service detection is limited to passive banners and selected plaintext HTTP evidence; TLS-aware and database/service-specific fingerprints remain future work.
+- Service detection is limited to passive banners and selected plaintext HTTP evidence (including port 3000); TLS-aware and database/service-specific fingerprints remain future work.
 - OS family estimates use a small set of TCP reply characteristics; validated fingerprint datasets and confidence scoring remain future work.
 - The next useful milestones are broader safe NSE module compatibility, TLS-aware service probes, better OS fingerprint validation, IPv6 raw networking, and public recall/precision benchmarks before making accuracy claims.
 
@@ -188,7 +198,7 @@ Build a Debian package from the source tree:
 ./scripts/build-deb.sh
 ```
 
-The versioned Debian package is written as `dist/netmapperv2_2.0.0.0_amd64.deb` (the architecture suffix varies) and copied to the parent `network-tools` directory. For compatibility, the build also writes `dist/netmapper.dpkg` and `../netmapper.dpkg`. The package identity is `netmapperv2`, Debian version `2.0.0.0`; it replaces the previous `netmapperv1` package and installs `/usr/bin/netmapper`, the man page, and the app icon. It does not depend on the Nmap executable. Cargo and the GitHub tag use SemVer `2.0.0` / `v2.0.0`. Install the versioned package with:
+The versioned Debian package is written as `dist/netmapperv2_2.0.0.0_amd64.deb` (the architecture suffix varies) and copied to the parent `network-tools` directory. For compatibility, the build also writes `dist/netmapper.dpkg` and `../netmapper.dpkg`. The package identity is `netmapperv2`, Debian version `2.0.0.0`; it replaces the previous `netmapperv1` package and installs `/usr/bin/netmapper`, the man page, and the app icon. It does not depend on the Nmap executable. Cargo uses SemVer `2.0.0`; the public Git tag is the major alias `v2`.
 
 ```sh
 sudo dpkg -i ./dist/netmapperv2_2.0.0.0_amd64.deb
@@ -209,7 +219,7 @@ cargo clippy --all-targets --locked -- -D warnings
 ./scripts/build-deb.sh
 ```
 
-Every push builds a Debian archive workflow artifact. Pushing the new tag `v2.0.0` creates a GitHub Release named from that tag, attaches the versioned `.deb`, and publishes the matching `CHANGELOG.md` section, including the known public history summary above. Existing tags and releases are retained. The tag must match the version in `Cargo.toml`; add a changelog section describing the problem solved, changes, and carried-forward issues for each release.
+Every push builds a Debian archive workflow artifact. Pushing the new tag `v2` creates a GitHub Release, attaches the versioned `.deb`, and publishes the matching `2.0.0` `CHANGELOG.md` section, including the known public history summary above. The release workflow also accepts a full SemVer tag. Existing `v1.*` tags and releases are retained. Add a changelog section describing the problem solved, changes, and carried-forward issues for each release.
 
 ## Limitations and roadmap
 
